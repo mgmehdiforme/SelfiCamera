@@ -207,6 +207,7 @@ class SelfiCameraApp(QObject):
 
         self.shortcuts.toggle_visibility_requested.connect(self.toggle_visibility)
         self.shortcuts.toggle_ghost_requested.connect(lambda: self.set_ghost_mode(not self.overlay.is_ghost_mode))
+        self.shortcuts.toggle_settings_requested.connect(self.toggle_settings_panel)
         self.shortcuts.snap_corner_requested.connect(self.overlay.snap_to_corner)
         self.shortcuts.cycle_blur_requested.connect(self.cycle_blur)
         self.shortcuts.quit_requested.connect(self.quit)

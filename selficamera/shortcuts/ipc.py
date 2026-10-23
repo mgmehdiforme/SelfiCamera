@@ -121,7 +121,7 @@ class ShortcutIPCServer(QThread):
         # Clean stale socket if dead
         if self.socket_path.exists():
             # Test if another instance is alive
-            test_res = ShortcutIPCClient.send_command("ping", timeout=0.08)
+            test_res = ShortcutIPCClient.send_command("ping", timeout=0.08, socket_path=self.socket_path)
             if test_res.get("success"):
                 logger.error("Another active SelfiCamera instance is already listening on %s", self.socket_path)
                 return
@@ -131,6 +131,8 @@ class ShortcutIPCServer(QThread):
                 pass
 
         try:
+            if self.socket_path.exists():
+                self.socket_path.unlink()
             self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._server_sock.bind(str(self.socket_path))
             # Restrict permissions to owner only (0600)

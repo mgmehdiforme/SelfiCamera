@@ -263,6 +263,16 @@ class AutoHidingHUD(QWidget):
         self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self._anim.start()
 
+    def trigger_hide(self, immediate: bool = True) -> None:
+        """Hide the HUD immediately or initiate fade out."""
+        self._hide_timer.stop()
+        self._anim.stop()
+        if immediate:
+            self._opacity_effect.setOpacity(0.0)
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        else:
+            self._start_fade_out()
+
     def trigger_hide_delayed(self) -> None:
         """Start the 1.2s inactivity timer before fading out if not pinned."""
         if not self._is_pinned:

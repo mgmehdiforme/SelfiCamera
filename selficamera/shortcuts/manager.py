@@ -18,6 +18,7 @@ class ShortcutManager(QObject):
 
     toggle_visibility_requested = Signal()
     toggle_ghost_requested = Signal()
+    toggle_settings_requested = Signal()
     snap_corner_requested = Signal(int)
     cycle_blur_requested = Signal()
     quit_requested = Signal()
@@ -66,6 +67,8 @@ class ShortcutManager(QObject):
             self.toggle_visibility_requested.emit()
         elif action in ("toggle_ghost", "ghost"):
             self.toggle_ghost_requested.emit()
+        elif action in ("toggle_settings", "settings"):
+            self.toggle_settings_requested.emit()
         elif action in ("snap_corner", "snap"):
             corner = int(params.get("corner", 4))
             self.snap_corner_requested.emit(corner)
@@ -106,10 +109,13 @@ class ShortcutManager(QObject):
                 register_key("X"): lambda: self.toggle_ghost_requested.emit(),
                 register_key("b"): lambda: self.cycle_blur_requested.emit(),
                 register_key("B"): lambda: self.cycle_blur_requested.emit(),
+                register_key("s"): lambda: self.toggle_settings_requested.emit(),
+                register_key("S"): lambda: self.toggle_settings_requested.emit(),
                 register_key("1"): lambda: self.snap_corner_requested.emit(1),
                 register_key("2"): lambda: self.snap_corner_requested.emit(2),
                 register_key("3"): lambda: self.snap_corner_requested.emit(3),
                 register_key("4"): lambda: self.snap_corner_requested.emit(4),
+                register_key("5"): lambda: self.snap_corner_requested.emit(5),
             }
 
             self._x11_running = True

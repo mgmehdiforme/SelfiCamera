@@ -6,7 +6,9 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from selficamera import __app_name__, __version__
@@ -44,7 +46,8 @@ def parse_args() -> argparse.Namespace:
     # Client IPC triggers (when instance is already running)
     parser.add_argument("--toggle", action="store_true", help="IPC: Toggle overlay visibility (Show / Hide)")
     parser.add_argument("--toggle-ghost", action="store_true", help="IPC: Toggle click-through Ghost Mode")
-    parser.add_argument("--snap", type=int, choices=[1, 2, 3, 4], default=None, help="IPC: Snap to desktop corner (1..4)")
+    parser.add_argument("--settings", action="store_true", help="IPC: Toggle Settings & Controls Panel")
+    parser.add_argument("--snap", type=int, choices=[1, 2, 3, 4, 5], default=None, help="IPC: Snap to desktop corner (1..4) or center (5)")
     parser.add_argument("--blur-cycle", action="store_true", help="IPC: Step blur level (0 -> 1 -> 2 -> 3 -> 0)")
     parser.add_argument("--status", action="store_true", help="IPC: Query status of running instance")
     parser.add_argument("--exit", action="store_true", help="IPC: Gracefully terminate running SelfiCamera instance")
@@ -61,6 +64,8 @@ def handle_ipc_command(args: argparse.Namespace) -> bool:
         action = "toggle_visibility"
     elif args.toggle_ghost:
         action = "toggle_ghost"
+    elif args.settings:
+        action = "toggle_settings"
     elif args.snap is not None:
         action = "snap_corner"
         params["corner"] = args.snap
@@ -145,6 +150,20 @@ def main() -> None:
     )
     app_controller.initialize()
     app_controller.start()
+
+    # Graceful shutdown handler for SIGINT (Ctrl+C) and SIGTERM
+    def _sig_handler(sig, frame):
+        logger.info("Received interrupt signal %s. Shutting down cleanly...", sig)
+        app_controller.quit()
+        qt_app.quit()
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    # Periodic timer to allow Python signal handler processing under Qt event loop
+    sig_timer = QTimer()
+    sig_timer.timeout.connect(lambda: None)
+    sig_timer.start(500)
 
     sys.exit(qt_app.exec())
 

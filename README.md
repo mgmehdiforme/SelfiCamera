@@ -9,19 +9,24 @@ SelfiCamera is built for software engineers, keynote presenters, educators, and 
 ## Key Features
 
 - **Frameless Circular Viewport**: 1:1 aspect-ratio locked video feed clipped cleanly with anti-aliasing and a soft Gaussian drop shadow.
-- **Fluid Drag & Scroll-to-Resize**: Effortlessly reposition anywhere on screen with automatic desktop boundary clamping. Scroll wheel steps through discrete presets:
-  - **Compact**: 160 px (IDE & terminal walkthroughs)
-  - **Standard**: 260 px (default meeting & presentation mode)
-  - **Focus**: 380 px (keynotes & introductions)
+- **Direct UI Controls & Floating Settings Panel**:
+  - **Auto-Docked Settings Panel**: Starts docked alongside the bubble for effortless mouse-driven configuration without memorizing shortcuts.
+  - **Pinned HUD Capsule (`📌`)**: Quick pill overlay with a 1-click Pin toggle to keep controls permanently visible on screen without fading out.
+  - **Fluid Drag & 1-Click Snapping**: Effortlessly reposition anywhere on screen with automatic desktop boundary clamping and visual cursor feedback (`OpenHand` / `ClosedHand`). 1-click spatial snapping to desktop corners or center (`[↖ TL]`, `[↗ TR]`, `[⏺ Center]`, `[↙ BL]`, `[↘ BR]`).
+  - **Stepped & Continuous Resizing**: Continuous diameter slider (`120px` to `600px`), on-bubble step buttons (`[−]` and `[+]`), mouse scroll-wheel scaling, and standard presets:
+    - **Compact**: 160 px (IDE & terminal walkthroughs)
+    - **Standard**: 260 px (default meeting & presentation mode)
+    - **Focus**: 380 px (keynotes & introductions)
 - **Always-on-Top Persistence**: Stays pinned above active fullscreen applications on both Wayland and X11.
 - **Click-Through Ghost Mode (`Super+Alt+X`)**: Passes all mouse clicks directly through the camera bubble to the code editor underneath.
-- **Offline 3-Tier AI Bokeh Blur**:
+- **Offline 4-Tier AI Bokeh Blur**:
   - **Tier 0 (Off)**: 0ms overhead, bypasses model
   - **Tier 1 (Subtle)**: ~12px Gaussian blur
   - **Tier 2 (Balanced)**: ~28px photographic bokeh (downscale-blur-upscale)
   - **Tier 3 (Heavy)**: ~56px heavy bokeh
-  - Powered by a local MediaPipe Selfie Segmentation ONNX float32 model (~1.3MB) running on CPU SIMD with zero cloud dependencies.
-- **Real-Time Auto-Light Boost**: Adaptive luminance compensation using temporal-smoothed gamma correction and precomputed 256-byte LUT (<1.2ms).
+  - Fine-grained intensity slider (0% to 100%) and quick cycling directly from the HUD.
+  - Powered by a local MediaPipe Selfie Segmentation ONNX float32 model (~353KB) running on CPU SIMD with zero cloud dependencies.
+- **Real-Time Light Control**: Quick toggle button on HUD, adaptive Auto-Light Boost, manual Brightness/Gamma slider (`0.40x` to `2.20x`) with `↺ Reset`, and Target Luminance tuning (<1.5ms).
 - **Dynamic Voice Aura Border**: Pulses and glows in real time to speech activity captured via PipeWire / PulseAudio (silence cyan $\rightarrow$ speech blue $\rightarrow$ peak magenta).
 - **Ubuntu System Tray & AppIndicator**: Comprehensive menu for camera device picking, resolution switching (480p, 720p, 1080p), mirror toggle, and clean exit.
 

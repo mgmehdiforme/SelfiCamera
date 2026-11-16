@@ -1,6 +1,17 @@
-"""Image processing pipeline subsystem: lighting boost, mirror, and 3-tier offline bokeh blur."""
-from selficamera.processor.lighting import AutoLightBoost
-from selficamera.processor.segmentation import SegmentationBlurEngine
-from selficamera.processor.pipeline import FrameProcessor
+"""Image processing: framing, light & color, segmentation and background compositing."""
 
-__all__ = ["AutoLightBoost", "SegmentationBlurEngine", "FrameProcessor"]
+from selficamera.processor.background import BackgroundCompositor
+from selficamera.processor.framing import AutoFramer, CropRect, compute_crop
+from selficamera.processor.lighting import ImageAdjuster
+from selficamera.processor.pipeline import FrameProcessor
+from selficamera.processor.segmentation import SegmentationEngine
+
+__all__ = [
+    "AutoFramer",
+    "BackgroundCompositor",
+    "CropRect",
+    "FrameProcessor",
+    "ImageAdjuster",
+    "SegmentationEngine",
+    "compute_crop",
+]

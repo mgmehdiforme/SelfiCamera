@@ -1,0 +1,27 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SelfiCamera
+GenericName=Camera Overlay
+Comment=Webcam overlay for screen recording and streaming — shapes, background blur, scenes
+Exec=selficamera
+Icon=selficamera
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=camera;webcam;overlay;bubble;youtube;stream;record;obs;facecam;
+StartupNotify=false
+StartupWMClass=selficamera
+SingleMainWindow=true
+Actions=Settings;Spotlight;Toggle;
+
+[Desktop Action Settings]
+Name=Settings
+Exec=selficamera --settings
+
+[Desktop Action Spotlight]
+Name=Spotlight
+Exec=selficamera --spotlight
+
+[Desktop Action Toggle]
+Name=Show / Hide Camera
+Exec=selficamera --toggle

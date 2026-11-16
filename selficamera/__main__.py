@@ -1,4 +1,8 @@
-"""Command Line Interface (CLI) entrypoint for SelfiCamera."""
+"""Command-line entry point.
+
+Remote-control commands (``--toggle``, ``--scene`` …) talk to the running instance
+over IPC without importing Qt, so they return in a few milliseconds.
+"""
 
 from __future__ import annotations
 
@@ -6,167 +10,221 @@ import argparse
 import json
 import logging
 import os
-import signal
 import sys
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication
+from typing import Any, Dict, List, Optional, Tuple
 
 from selficamera import __app_name__, __version__
-from selficamera.app import SelfiCameraApp
-from selficamera.shortcuts.ipc import ShortcutIPCClient, get_ipc_socket_path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("selficamera")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
         prog="selficamera",
-        description="SelfiCamera: Ultra-lightweight offline circular presenter camera overlay for Ubuntu Linux.",
+        description="SelfiCamera: an offline webcam overlay for screen recording and streaming on Linux.",
+        epilog="Run without remote-control flags to start the app. If it is already running, the camera is shown.",
     )
-    parser.add_argument("-v", "--version", action="version", version=f"{__app_name__} {__version__}")
+    p.add_argument("-v", "--version", action="version", version=f"{__app_name__} {__version__}")
 
-    # Launch configuration options
-    parser.add_argument("-d", "--device", type=str, default=None, help="V4L2 camera device node path (e.g. /dev/video0)")
-    parser.add_argument("-W", "--width", type=int, default=None, help="Capture width (default 1280)")
-    parser.add_argument("-H", "--height", type=int, default=None, help="Capture height (default 720)")
-    parser.add_argument("-f", "--fps", type=int, default=None, help="Capture frames per second (default 30)")
-    parser.add_argument("-s", "--size", type=int, default=None, help="Initial circle diameter (120..600)")
-    parser.add_argument("-b", "--blur", type=int, choices=[0, 1, 2, 3], default=None, help="Initial blur tier (0..3)")
-    parser.add_argument("--no-mirror", action="store_true", help="Start with horizontal mirror disabled")
-    parser.add_argument("--no-light", action="store_true", help="Start with Auto-Light Boost disabled")
-    parser.add_argument("--ghost", action="store_true", help="Start immediately in click-through Ghost Mode")
-    parser.add_argument("--headless-mock", action="store_true", help="Run with synthetic mock video & audio feeds")
-    parser.add_argument("--config", type=str, default=None, help="Custom configuration JSON path")
+    start = p.add_argument_group("startup options")
+    start.add_argument("-d", "--device", help="Camera device, e.g. /dev/video0")
+    start.add_argument("-W", "--width", type=int, help="Capture width (e.g. 1280)")
+    start.add_argument("-H", "--height", type=int, help="Capture height (e.g. 720)")
+    start.add_argument("-f", "--fps", type=int, help="Capture frame rate")
+    start.add_argument("-s", "--size", type=int, help="Bubble size (short side, 120-800 px)")
+    start.add_argument("--shape", choices=["circle", "rounded", "landscape", "portrait"], help="Bubble shape")
+    start.add_argument("--background", choices=["none", "blur", "color", "image", "remove"], help="Background effect")
+    start.add_argument("--no-mirror", action="store_true", help="Start with mirror off")
+    start.add_argument("--ghost", action="store_true", help="Start in click-through mode")
+    start.add_argument("--demo", "--headless-mock", dest="demo", action="store_true", help="Use a synthetic camera and mic")
+    start.add_argument("--config", help="Use a different config file")
+    start.add_argument("--debug", action="store_true", help="Verbose logging")
 
-    # Client IPC triggers (when instance is already running)
-    parser.add_argument("--toggle", action="store_true", help="IPC: Toggle overlay visibility (Show / Hide)")
-    parser.add_argument("--toggle-ghost", action="store_true", help="IPC: Toggle click-through Ghost Mode")
-    parser.add_argument("--settings", action="store_true", help="IPC: Toggle Settings & Controls Panel")
-    parser.add_argument("--snap", type=int, choices=[1, 2, 3, 4, 5], default=None, help="IPC: Snap to desktop corner (1..4) or center (5)")
-    parser.add_argument("--blur-cycle", action="store_true", help="IPC: Step blur level (0 -> 1 -> 2 -> 3 -> 0)")
-    parser.add_argument("--status", action="store_true", help="IPC: Query status of running instance")
-    parser.add_argument("--exit", action="store_true", help="IPC: Gracefully terminate running SelfiCamera instance")
+    remote = p.add_argument_group("remote control (running instance)")
+    remote.add_argument("--toggle", action="store_true", help="Show / hide the camera")
+    remote.add_argument("--show", action="store_true", help="Show the camera")
+    remote.add_argument("--hide", action="store_true", help="Hide the camera")
+    remote.add_argument("--spotlight", action="store_true", help="Toggle spotlight (big and centered)")
+    remote.add_argument("--background-cycle", "--blur-cycle", dest="background_cycle", action="store_true", help="Next background effect")
+    remote.add_argument("--mirror-toggle", action="store_true", help="Toggle mirror")
+    remote.add_argument("--toggle-ghost", action="store_true", help="Toggle click-through")
+    remote.add_argument("--settings", action="store_true", help="Open / close settings")
+    remote.add_argument("--snap", type=int, choices=[1, 2, 3, 4, 5], help="1 TL, 2 TR, 3 BL, 4 BR, 5 center")
+    remote.add_argument("--scene", metavar="NAME", help="Apply a saved scene")
+    remote.add_argument("--set", metavar="KEY=VALUE", action="append", help="Change a setting, e.g. --set size=320")
+    remote.add_argument("--status", action="store_true", help="Print the running instance's state as JSON")
+    remote.add_argument("--exit", "--quit", dest="exit", action="store_true", help="Quit the running instance")
 
-    return parser.parse_args()
-
-
-def handle_ipc_command(args: argparse.Namespace) -> bool:
-    """Check if command is an IPC action and forward to running instance."""
-    action = None
-    params = {}
-
-    if args.toggle:
-        action = "toggle_visibility"
-    elif args.toggle_ghost:
-        action = "toggle_ghost"
-    elif args.settings:
-        action = "toggle_settings"
-    elif args.snap is not None:
-        action = "snap_corner"
-        params["corner"] = args.snap
-    elif args.blur_cycle:
-        action = "cycle_blur"
-    elif args.status:
-        action = "get_status"
-    elif args.exit:
-        action = "quit"
-
-    if action is not None:
-        res = ShortcutIPCClient.send_command(action, params)
-        if res.get("success"):
-            if action == "get_status":
-                print(json.dumps(res.get("state", {}), indent=2))
-            else:
-                print(f"[SelfiCamera IPC] {res.get('message', 'Action sent successfully')}")
-            return True
-        else:
-            if args.toggle_ghost:
-                print("[SelfiCamera] No active instance running. Starting new instance in Ghost Mode...")
-                args.ghost = True
-                return False
-            elif args.toggle:
-                print("[SelfiCamera] No active instance running. Starting new instance...")
-                return False
-            else:
-                print(f"[SelfiCamera IPC] No active SelfiCamera instance is currently running.\nLaunch SelfiCamera with: ./run.sh", file=sys.stderr)
-                sys.exit(1)
-
-    return False
+    setup = p.add_argument_group("setup")
+    setup.add_argument("--install-shortcuts", action="store_true", help="Register global shortcuts in GNOME")
+    setup.add_argument("--remove-shortcuts", action="store_true", help="Remove GNOME shortcuts")
+    setup.add_argument("--install-model", action="store_true", help="Download the offline AI models: background and face (one time, ~500 KB)")
+    return p
 
 
-def main() -> None:
-    args = parse_args()
+def remote_actions(args: argparse.Namespace) -> List[Tuple[str, Dict[str, Any]]]:
+    """Translate remote-control flags into IPC (action, params) pairs."""
+    from selficamera.config import parse_cli_value
 
-    # 1. Handle explicit IPC actions
-    if handle_ipc_command(args):
-        sys.exit(0)
+    actions: List[Tuple[str, Dict[str, Any]]] = []
+    for item in args.set or []:
+        if "=" not in item:
+            raise SystemExit(f"--set expects KEY=VALUE, got '{item}'")
+        key, raw = item.split("=", 1)
+        try:
+            value = parse_cli_value(key.strip(), raw.strip())
+        except (KeyError, ValueError) as exc:
+            raise SystemExit(f"Invalid --set {item}: {exc}") from None
+        actions.append(("set", {"key": key.strip(), "value": value}))
+    flags = (
+        ("toggle", "toggle_visibility"),
+        ("show", "show"),
+        ("hide", "hide"),
+        ("spotlight", "toggle_spotlight"),
+        ("background_cycle", "cycle_background"),
+        ("mirror_toggle", "toggle_mirror"),
+        ("toggle_ghost", "toggle_ghost"),
+        ("settings", "toggle_settings"),
+    )
+    for attr, action in flags:
+        if getattr(args, attr):
+            actions.append((action, {}))
+    if args.snap is not None:
+        actions.append(("snap", {"position": args.snap}))
+    if args.scene:
+        actions.append(("scene", {"name": args.scene}))
+    if args.status:
+        actions.append(("get_status", {}))
+    if args.exit:
+        actions.append(("quit", {}))
+    return actions
 
-    # 2. Check for existing running instance before starting a new one
-    sock_path = get_ipc_socket_path()
-    if sock_path.exists():
-        test_res = ShortcutIPCClient.send_command("ping", timeout=0.1)
-        if test_res.get("success"):
-            print("[SelfiCamera] An active instance is already running. Bringing to focus.")
-            ShortcutIPCClient.send_command("toggle_visibility")
-            sys.exit(0)
 
-    # 3. Launch main GUI application
-    if "QT_QPA_PLATFORM" not in os.environ:
-        os.environ["QT_QPA_PLATFORM"] = "xcb;wayland"
+def run_setup(args: argparse.Namespace) -> Optional[int]:
+    from selficamera import desktop
 
-    # Set high DPI and Wayland / X11 attributes if needed
-    qt_app = QApplication(sys.argv)
-    qt_app.setApplicationName(__app_name__)
-    qt_app.setApplicationVersion(__version__)
-    qt_app.setQuitOnLastWindowClosed(False)
+    if args.install_shortcuts:
+        ok, msg = desktop.GnomeShortcuts().install()
+        print(msg)
+        return 0 if ok else 1
+    if args.remove_shortcuts:
+        ok, msg = desktop.GnomeShortcuts().remove()
+        print(msg)
+        return 0 if ok else 1
+    if args.install_model:
+        print("Downloading the MediaPipe Selfie Segmenter model (Apache-2.0, ~250 KB)…")
+        ok, msg = desktop.install_model()
+        print(msg)
+        print("Downloading the YuNet face detector for auto light (MIT, ~230 KB)…")
+        ok_face, msg_face = desktop.install_face_model()
+        print(msg_face)
+        return 0 if ok and ok_face else 1
+    return None
 
-    cli_overrides = {}
+
+def cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    o: Dict[str, Any] = {}
     if args.device:
-        cli_overrides["device_path"] = args.device
+        o["device_path"] = args.device
     if args.width and args.height:
-        cli_overrides["resolution"] = [args.width, args.height]
+        o["resolution"] = [args.width, args.height]
     if args.fps:
-        cli_overrides["fps"] = args.fps
+        o["fps"] = args.fps
     if args.size:
-        cli_overrides["diameter"] = args.size
-    if args.blur is not None:
-        cli_overrides["blur_level"] = args.blur
+        o["size"] = args.size
+    if args.shape:
+        o["shape"] = args.shape
+    if args.background:
+        o["background_mode"] = args.background
     if args.no_mirror:
-        cli_overrides["mirror"] = False
-    if args.no_light:
-        cli_overrides["auto_light"] = False
+        o["mirror"] = False
     if args.ghost:
-        cli_overrides["click_through"] = True
+        o["click_through"] = True
+    return o
 
-    app_controller = SelfiCameraApp(
-        config_path=args.config,
-        mock_mode=args.headless_mock,
-        cli_overrides=cli_overrides,
-    )
-    app_controller.initialize()
-    app_controller.start()
 
-    # Graceful shutdown handler for SIGINT (Ctrl+C) and SIGTERM
-    def _sig_handler(sig, frame):
-        logger.info("Received interrupt signal %s. Shutting down cleanly...", sig)
-        app_controller.quit()
-        qt_app.quit()
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
 
-    signal.signal(signal.SIGINT, _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
+    code = run_setup(args)
+    if code is not None:
+        return code
 
-    # Periodic timer to allow Python signal handler processing under Qt event loop
-    sig_timer = QTimer()
-    sig_timer.timeout.connect(lambda: None)
-    sig_timer.start(500)
+    from selficamera.ipc_client import send_command
 
-    sys.exit(qt_app.exec())
+    actions = remote_actions(args)
+    if actions:
+        exit_code = 0
+        for action, params in actions:
+            res = send_command(action, params)
+            if not res.get("success"):
+                if action in ("toggle_visibility", "show") and "not running" in str(res.get("error", "")):
+                    break  # fall through and start the app
+                print(f"SelfiCamera: {res.get('error', 'failed')}", file=sys.stderr)
+                return 1
+            if action == "get_status":
+                print(json.dumps(res.get("state", {}), indent=2, sort_keys=True))
+        else:
+            return exit_code
+
+    # Single instance: a second launch just shows the running camera.
+    if send_command("ping", timeout=0.3).get("success"):
+        send_command("show")
+        print("SelfiCamera is already running.")
+        return 0
+
+    from selficamera.desktop import XCB_HINT, choose_qt_platform, setup_logging
+
+    log_file = setup_logging(args.debug)
+    platform, limited = choose_qt_platform()
+    if platform:
+        os.environ["QT_QPA_PLATFORM"] = platform
+    if limited:
+        logger.warning(
+            "Running as a native Wayland window: GNOME will not let the camera stay on top or "
+            "snap to corners. Fix: %s, then restart SelfiCamera.",
+            XCB_HINT,
+        )
+    os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
+
+    import signal
+
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from selficamera.app import SelfiCameraApp
+    from selficamera.ui.icons import app_icon
+
+    qt_app = QApplication(sys.argv[:1])
+    qt_app.setApplicationName(__app_name__)
+    qt_app.setApplicationDisplayName(__app_name__)
+    qt_app.setApplicationVersion(__version__)
+    qt_app.setDesktopFileName("selficamera")
+    qt_app.setWindowIcon(app_icon())
+    qt_app.setQuitOnLastWindowClosed(False)
+    logger.info("SelfiCamera %s starting (log: %s, platform: %s)", __version__, log_file, qt_app.platformName())
+
+    controller = SelfiCameraApp(config_path=args.config, mock_mode=args.demo, cli_overrides=cli_overrides(args))
+    controller.limited_wayland = qt_app.platformName().startswith("wayland")
+    if "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+        # Shadow/rounded-corner extensions would draw a box around the transparent bubble.
+        from selficamera.desktop import ShadowExtensions
+
+        ShadowExtensions().exclude()
+    controller.initialize()
+    controller.start()
+
+    def _on_signal(signum, _frame) -> None:
+        logger.info("Signal %s received", signum)
+        controller.quit()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    keepalive = QTimer()
+    keepalive.timeout.connect(lambda: None)
+    keepalive.start(400)
+    return qt_app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -4,12 +4,28 @@ from __future__ import annotations
 
 import logging
 import math
-import time
-from typing import Optional
+from typing import List, Optional, Tuple
 import numpy as np
 from PySide6.QtCore import QMutex, QMutexLocker, QThread, Signal
 
 logger = logging.getLogger(__name__)
+
+
+def list_input_devices() -> List[Tuple[str, str]]:
+    """Return (id, label) pairs for microphones; id is the sounddevice name."""
+    try:
+        import sounddevice as sd
+
+        out: List[Tuple[str, str]] = []
+        seen = set()
+        for dev in sd.query_devices():
+            if dev.get("max_input_channels", 0) > 0 and dev["name"] not in seen:
+                seen.add(dev["name"])
+                out.append((dev["name"], dev["name"]))
+        return out
+    except Exception as exc:  # PortAudio missing, no devices, etc.
+        logger.debug("Cannot list audio input devices: %s", exc)
+        return []
 
 
 class AudioMonitorWorker(QThread):
@@ -78,7 +94,13 @@ class AudioMonitorWorker(QThread):
     def stop(self) -> None:
         """Stop worker cleanly."""
         self._running = False
-        self.wait(1000)
+        self.wait(1500)
+
+    def restart_with_device(self, device: Optional[str | int]) -> None:
+        """Switch microphone by restarting the stream."""
+        self.stop()
+        self.device = device
+        self.start()
 
     def run(self) -> None:
         """Audio streaming loop."""

@@ -1,222 +1,136 @@
-"""Ubuntu AppIndicator and QSystemTrayIcon controller."""
+"""Quick-action menu (shared by the tray icon and the bubble's right-click menu)."""
 
 from __future__ import annotations
 
-import logging
-from typing import Callable, List, Optional, Tuple
-from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPainter, QPixmap
+from typing import Any, Optional
+
+from PySide6.QtCore import QObject, QPoint
+from PySide6.QtGui import QActionGroup
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
-from selficamera.capture.v4l2_devices import STANDARD_RESOLUTIONS, V4L2DeviceScanner, VideoDeviceInfo
-
-logger = logging.getLogger(__name__)
-
-
-def create_default_tray_icon() -> QIcon:
-    """Generate a clean 64x64 neon circular camera icon."""
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(QColor(0, 0, 0, 0))
-
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-    # Neon circle border
-    painter.setPen(QColor(0, 229, 255, 230))
-    painter.setBrush(QColor(30, 30, 46, 220))
-    painter.drawEllipse(4, 4, 56, 56)
-
-    # Camera body
-    painter.setPen(QColor(255, 255, 255, 220))
-    painter.setBrush(QColor(0, 229, 255, 180))
-    painter.drawRoundedRect(18, 24, 28, 20, 3, 3)
-
-    # Lens circle
-    painter.setBrush(QColor(30, 30, 46, 255))
-    painter.drawEllipse(26, 28, 12, 12)
-
-    painter.end()
-    return QIcon(pixmap)
+from selficamera.config import BACKGROUND_LABELS, BACKGROUND_MODES, SHAPE_LABELS, SHAPES, SIZE_PRESETS
+from selficamera.ui import icons
+from selficamera.ui.overlay import POSITION_LABELS
+from selficamera.ui.theme import MENU_STYLESHEET
 
 
-class SystemTrayController(QObject):
-    """Manages system tray icon, device selection menus, and action signals."""
+def populate_quick_menu(menu: QMenu, c: Any, include_visibility: bool = True) -> None:
+    """Fill ``menu`` with actions reflecting the controller's current state."""
+    menu.clear()
+    menu.setStyleSheet(MENU_STYLESHEET)
 
-    device_selected = Signal(str)
-    resolution_selected = Signal(int, int)
-    mirror_toggled = Signal(bool)
-    auto_light_toggled = Signal(bool)
-    blur_level_selected = Signal(int)
-    ghost_mode_toggled = Signal(bool)
-    settings_requested = Signal()
-    reset_requested = Signal()
-    quit_requested = Signal()
+    if include_visibility:
+        visible = bool(c.get("visible"))
+        act = menu.addAction(icons.icon("eye_off" if visible else "eye", 16), "Hide camera" if visible else "Show camera")
+        act.triggered.connect(c.toggle_visibility)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    act = menu.addAction(icons.icon("sliders", 16), "Settings…")
+    act.triggered.connect(lambda: c.open_settings())
+
+    act = menu.addAction(icons.icon("spotlight", 16), "Exit spotlight" if c.in_spotlight() else "Spotlight")
+    act.triggered.connect(c.toggle_spotlight)
+    menu.addSeparator()
+
+    bg_menu = menu.addMenu(icons.icon("background", 16), "Background")
+    bg_menu.setStyleSheet(MENU_STYLESHEET)
+    group = QActionGroup(bg_menu)
+    current_bg = c.get("background_mode")
+    for mode in BACKGROUND_MODES:
+        a = bg_menu.addAction(BACKGROUND_LABELS[mode])
+        a.setCheckable(True)
+        a.setChecked(mode == current_bg)
+        a.setActionGroup(group)
+        a.triggered.connect(lambda _=False, m=mode: c.set("background_mode", m))
+
+    shape_menu = menu.addMenu(icons.icon("shape", 16), "Shape")
+    shape_menu.setStyleSheet(MENU_STYLESHEET)
+    sgroup = QActionGroup(shape_menu)
+    current_shape = c.get("shape")
+    for shape in SHAPES:
+        a = shape_menu.addAction(SHAPE_LABELS[shape])
+        a.setCheckable(True)
+        a.setChecked(shape == current_shape)
+        a.setActionGroup(sgroup)
+        a.triggered.connect(lambda _=False, s=shape: c.set("shape", s))
+    shape_menu.addSeparator()
+    for label, px in SIZE_PRESETS.items():
+        a = shape_menu.addAction({"S": "Small", "M": "Medium", "L": "Large"}[label])
+        a.triggered.connect(lambda _=False, v=px: c.set_size_animated(v))
+
+    pos_menu = menu.addMenu(icons.icon("move", 16), "Move to")
+    pos_menu.setStyleSheet(MENU_STYLESHEET)
+    for pos, label in POSITION_LABELS.items():
+        a = pos_menu.addAction(label)
+        a.triggered.connect(lambda _=False, p=pos: c.snap(p))
+
+    scenes = c.scene_names()
+    scene_menu = menu.addMenu(icons.icon("layers", 16), "Scenes")
+    scene_menu.setStyleSheet(MENU_STYLESHEET)
+    if scenes:
+        for name in scenes:
+            a = scene_menu.addAction(name)
+            a.triggered.connect(lambda _=False, n=name: c.apply_scene(n))
+    else:
+        a = scene_menu.addAction("No scenes yet — save one in Settings")
+        a.setEnabled(False)
+
+    menu.addSeparator()
+    a = menu.addAction(icons.icon("flip", 16), "Mirror")
+    a.setCheckable(True)
+    a.setChecked(bool(c.get("mirror")))
+    a.toggled.connect(lambda v: c.set("mirror", v))
+
+    a = menu.addAction(icons.icon("pin", 16), "Always on top")
+    a.setCheckable(True)
+    a.setChecked(bool(c.get("always_on_top")))
+    a.toggled.connect(lambda v: c.set("always_on_top", v))
+
+    a = menu.addAction(icons.icon("ghost", 16), "Click-through")
+    a.setCheckable(True)
+    a.setChecked(bool(c.get("click_through")))
+    a.toggled.connect(lambda v: c.set("click_through", v))
+
+    menu.addSeparator()
+    a = menu.addAction(icons.icon("power", 16), "Quit SelfiCamera")
+    a.triggered.connect(c.quit)
+
+
+class TrayController(QObject):
+    """System tray icon. Left click shows/hides the camera; the menu has every quick action."""
+
+    def __init__(self, controller: Any, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self._parent = parent
-
-        self.tray_icon = QSystemTrayIcon(create_default_tray_icon(), parent)
-        self.tray_icon.setToolTip("SelfiCamera - Presenter Bubble")
-
-        self.menu = QMenu(parent)
-        self._build_menu()
+        self.c = controller
+        self.tray_icon = QSystemTrayIcon(icons.app_icon(), parent)
+        self.tray_icon.setToolTip("SelfiCamera")
+        self.menu = QMenu()
+        self.menu.aboutToShow.connect(self.refresh)
+        self.refresh()
         self.tray_icon.setContextMenu(self.menu)
+        self.tray_icon.activated.connect(self._on_activated)
 
-    def _build_menu(self) -> None:
-        """Construct full tray context menu."""
-        self.menu.clear()
+    @property
+    def available(self) -> bool:
+        return QSystemTrayIcon.isSystemTrayAvailable()
 
-        # Header status item
-        self.action_header = QAction("● SelfiCamera (Active)", self.menu)
-        self.action_header.setEnabled(False)
-        self.menu.addAction(self.action_header)
+    def refresh(self) -> None:
+        populate_quick_menu(self.menu, self.c)
 
-        # Settings Action
-        self.action_settings = QAction("⚙ Settings...", self.menu)
-        self.action_settings.triggered.connect(self.settings_requested)
-        self.menu.addAction(self.action_settings)
-        self.menu.addSeparator()
+    def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.c.toggle_visibility()
 
-        # Camera Device Submenu
-        self.device_menu = self.menu.addMenu("Camera Device")
-        self.device_action_group = QActionGroup(self.device_menu)
-        self.device_action_group.setExclusive(True)
-        self.populate_devices()
-
-        # Resolution Submenu
-        self.res_menu = self.menu.addMenu("Resolution")
-        self.res_action_group = QActionGroup(self.res_menu)
-        self.res_action_group.setExclusive(True)
-        self._populate_resolutions()
-
-        self.menu.addSeparator()
-
-        # Mirror toggle
-        self.action_mirror = QAction("Horizontal Mirror (Flip)", self.menu)
-        self.action_mirror.setCheckable(True)
-        self.action_mirror.setChecked(True)
-        self.action_mirror.toggled.connect(self.mirror_toggled)
-        self.menu.addAction(self.action_mirror)
-
-        # Auto-Light Boost toggle
-        self.action_light = QAction("Auto-Light Boost", self.menu)
-        self.action_light.setCheckable(True)
-        self.action_light.setChecked(True)
-        self.action_light.toggled.connect(self.auto_light_toggled)
-        self.menu.addAction(self.action_light)
-
-        # Background Blur Submenu
-        self.blur_menu = self.menu.addMenu("Background Blur")
-        self.blur_action_group = QActionGroup(self.blur_menu)
-        self.blur_action_group.setExclusive(True)
-        self._populate_blur_tiers()
-
-        # Ghost Mode toggle
-        self.action_ghost = QAction("Click-Through Ghost Mode", self.menu)
-        self.action_ghost.setCheckable(True)
-        self.action_ghost.setChecked(False)
-        self.action_ghost.toggled.connect(self.ghost_mode_toggled)
-        self.menu.addAction(self.action_ghost)
-
-        self.menu.addSeparator()
-
-        # Reset & Quit
-        self.action_reset = QAction("Reset Position & Size", self.menu)
-        self.action_reset.triggered.connect(self.reset_requested)
-        self.menu.addAction(self.action_reset)
-
-        self.action_quit = QAction("Quit SelfiCamera", self.menu)
-        self.action_quit.triggered.connect(self.quit_requested)
-        self.menu.addAction(self.action_quit)
-
-    def populate_devices(self, current_path: str = "/dev/video0") -> None:
-        """Scan and populate available V4L2 cameras in the submenu."""
-        self.device_menu.clear()
-        devices = V4L2DeviceScanner.list_devices()
-
-        if not devices:
-            action = QAction("No cameras detected (Mock Mode)", self.device_menu)
-            action.setEnabled(False)
-            self.device_menu.addAction(action)
-        else:
-            for dev in devices:
-                action = QAction(dev.display_name, self.device_menu)
-                action.setCheckable(True)
-                if dev.device_path == current_path:
-                    action.setChecked(True)
-                # Capture dev.device_path in closure
-                action.triggered.connect(lambda checked, p=dev.device_path: self.device_selected.emit(p))
-                self.device_action_group.addAction(action)
-                self.device_menu.addAction(action)
-
-        self.device_menu.addSeparator()
-        action_refresh = QAction("Refresh Devices", self.device_menu)
-        action_refresh.triggered.connect(lambda: self.populate_devices(current_path))
-        self.device_menu.addAction(action_refresh)
-
-    def _populate_resolutions(self) -> None:
-        """Populate standard resolution options."""
-        labels = {
-            (640, 480): "640 x 480 (SD)",
-            (1280, 720): "1280 x 720 (HD - Recommended)",
-            (1920, 1080): "1920 x 1080 (FHD)",
-        }
-        for (w, h), label in labels.items():
-            action = QAction(label, self.res_menu)
-            action.setCheckable(True)
-            if (w, h) == (1280, 720):
-                action.setChecked(True)
-            action.triggered.connect(lambda checked, width=w, height=h: self.resolution_selected.emit(width, height))
-            self.res_action_group.addAction(action)
-            self.res_menu.addAction(action)
-
-    def _populate_blur_tiers(self) -> None:
-        """Populate blur tier radio options."""
-        tiers = [
-            (0, "Level 0: Off"),
-            (1, "Level 1: Subtle"),
-            (2, "Level 2: Balanced"),
-            (3, "Level 3: Heavy"),
-        ]
-        self._blur_actions = {}
-        for level, label in tiers:
-            action = QAction(label, self.blur_menu)
-            action.setCheckable(True)
-            if level == 2:
-                action.setChecked(True)
-            action.triggered.connect(lambda checked, lvl=level: self.blur_level_selected.emit(lvl))
-            self.blur_action_group.addAction(action)
-            self.blur_menu.addAction(action)
-            self._blur_actions[level] = action
-
-    def set_active_blur_level(self, level: int) -> None:
-        """Sync check state of blur tier in menu."""
-        if hasattr(self, "_blur_actions") and level in self._blur_actions:
-            self._blur_actions[level].setChecked(True)
-
-    def set_ghost_mode_checked(self, checked: bool) -> None:
-        """Sync ghost mode checkbox."""
-        self.action_ghost.blockSignals(True)
-        self.action_ghost.setChecked(checked)
-        self.action_ghost.blockSignals(False)
-
-    def set_mirror_checked(self, checked: bool) -> None:
-        """Sync mirror checkbox."""
-        self.action_mirror.blockSignals(True)
-        self.action_mirror.setChecked(checked)
-        self.action_mirror.blockSignals(False)
-
-    def set_light_checked(self, checked: bool) -> None:
-        """Sync light checkbox."""
-        self.action_light.blockSignals(True)
-        self.action_light.setChecked(checked)
-        self.action_light.blockSignals(False)
+    def set_tooltip(self, text: str) -> None:
+        self.tray_icon.setToolTip(text)
 
     def show(self) -> None:
-        """Show system tray icon."""
         self.tray_icon.show()
 
     def hide(self) -> None:
-        """Hide system tray icon."""
         self.tray_icon.hide()
+
+
+def exec_context_menu(controller: Any, global_pos: QPoint, parent: Optional[QWidget] = None) -> None:
+    menu = QMenu(parent)
+    populate_quick_menu(menu, controller)
+    menu.exec(global_pos)

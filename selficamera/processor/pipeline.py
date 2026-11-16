@@ -1,129 +1,250 @@
-"""Composite image processing pipeline linking mirror, auto-light boost, and segmentation blur."""
+"""Frame pipeline: mirror -> framing crop -> resize to display -> light & color -> background.
+
+The processor is called from the capture thread. Settings are changed from the GUI
+thread through :meth:`FrameProcessor.configure`, which is lock-protected and applied
+atomically between frames.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import threading
+import time
+from typing import Any, Dict, Optional, Tuple
+
 import cv2
 import numpy as np
-from PySide6.QtGui import QImage
 
-from selficamera.processor.lighting import AutoLightBoost
-from selficamera.processor.segmentation import SegmentationBlurEngine
+from selficamera.processor.background import BackgroundCompositor
+from selficamera.processor.face import FaceDetector
+from selficamera.processor.framing import AutoFramer, CropRect, compute_crop
+from selficamera.processor.lighting import ImageAdjuster, Meter
+from selficamera.processor.segmentation import SegmentationEngine
 
 logger = logging.getLogger(__name__)
 
+MAX_OUTPUT_SIDE = 1280
+AUTOFRAME_EVERY_N = 4
+METER_EVERY_N = 4  # face detection for auto light runs on every 4th frame (~7.5 Hz)
+FACE_HOLD_FRAMES = 8  # keep metering on the last face for ~1 s if it is briefly lost
+
+PROCESSOR_KEYS = (
+    "mirror",
+    "zoom",
+    "pan_x",
+    "pan_y",
+    "auto_frame",
+    "auto_light",
+    "brightness",
+    "contrast",
+    "saturation",
+    "warmth",
+    "background_mode",
+    "blur_strength",
+    "background_color",
+    "background_image",
+)
+
 
 class FrameProcessor:
-    """Orchestrates end-to-end frame transformations: mirror, lighting, blur, and 1:1 cropping."""
+    """Stateful per-frame processor."""
 
     def __init__(
         self,
-        mirror: bool = True,
-        auto_light: bool = True,
-        blur_level: int = 2,
+        settings: Optional[Dict[str, Any]] = None,
+        output_size: Tuple[int, int] = (260, 260),
+        segmentation: Optional[SegmentationEngine] = None,
         model_path: Optional[str] = None,
-        manual_gamma: float = 1.0,
-        target_luminance: float = 125.0,
-        blur_intensity: Optional[int] = None,
+        face_detector: Optional[FaceDetector] = None,
     ) -> None:
-        self.mirror_enabled = mirror
-        self.auto_light = AutoLightBoost(
-            enabled=auto_light,
-            target_luminance=target_luminance,
-            manual_gamma=manual_gamma,
+        self._lock = threading.Lock()
+        self.mirror = True
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.auto_frame = False
+        self.background_mode = "none"
+        self.blur_strength = 60
+        self.background_color = "#00B140"
+        self.background_image = ""
+
+        self.adjuster = ImageAdjuster()
+        self.segmentation = segmentation or SegmentationEngine(model_path=model_path)
+        self.compositor = BackgroundCompositor()
+        self.framer = AutoFramer()
+        self.face = face_detector if face_detector is not None else FaceDetector()
+        self._meter: Optional[Meter] = None
+        self._face_misses = 0
+        self._last_mask: Optional[np.ndarray] = None
+        self._output_size = self._sanitize_size(output_size)
+        self._frame_index = 0
+        self.last_timings: Dict[str, float] = {}
+        if settings:
+            self.configure(**{k: v for k, v in settings.items() if k in PROCESSOR_KEYS})
+
+    # ---------------------------------------------------------------- settings
+    @staticmethod
+    def _sanitize_size(size: Tuple[int, int]) -> Tuple[int, int]:
+        w, h = int(size[0]), int(size[1])
+        w, h = max(16, w), max(16, h)
+        longest = max(w, h)
+        if longest > MAX_OUTPUT_SIDE:
+            s = MAX_OUTPUT_SIDE / longest
+            w, h = int(w * s), int(h * s)
+        return (w, h)
+
+    @property
+    def output_size(self) -> Tuple[int, int]:
+        return self._output_size
+
+    def set_output_size(self, width: int, height: int) -> None:
+        with self._lock:
+            new = self._sanitize_size((width, height))
+            if new != self._output_size:
+                self._output_size = new
+                self.segmentation.reset()
+                self._meter = None
+                self._last_mask = None
+
+    def configure(self, **settings: Any) -> None:
+        with self._lock:
+            for key, value in settings.items():
+                if key not in PROCESSOR_KEYS:
+                    continue
+                if key in ("auto_light", "brightness", "contrast", "saturation", "warmth"):
+                    setattr(self.adjuster, key, value)
+                elif key == "background_image":
+                    self.background_image = value or ""
+                    self.compositor.set_image(self.background_image)
+                elif key == "auto_frame":
+                    self.auto_frame = bool(value)
+                    if not value:
+                        self.framer.reset()
+                else:
+                    setattr(self, key, value)
+
+    @property
+    def needs_mask(self) -> bool:
+        return self.background_mode != "none"
+
+    # -------------------------------------------------------------- processing
+    def crop_rect(self, frame_w: int, frame_h: int) -> CropRect:
+        """Crop rectangle in *source* (unmirrored) frame coordinates.
+
+        Pan is expressed in what the viewer sees, so it is flipped when mirroring.
+        The auto-frame focus is tracked in source coordinates.
+        """
+        ow, oh = self._output_size
+        pan_x = -self.pan_x if self.mirror else self.pan_x
+        return compute_crop(
+            frame_w,
+            frame_h,
+            ow / oh,
+            zoom=self.zoom,
+            pan_x=pan_x,
+            pan_y=self.pan_y,
+            focus=self.framer.focus if self.auto_frame else None,
         )
-        self.segmentation = SegmentationBlurEngine(
-            model_path=model_path,
-            tier=blur_level,
-            intensity=blur_intensity,
-        )
 
-    @property
-    def auto_light_enabled(self) -> bool:
-        return self.auto_light.enabled
-
-    @auto_light_enabled.setter
-    def auto_light_enabled(self, val: bool) -> None:
-        self.auto_light.enabled = val
-
-    @property
-    def manual_gamma(self) -> float:
-        return self.auto_light.manual_gamma
-
-    def set_manual_gamma(self, gamma: float) -> None:
-        """Set manual brightness/gamma factor."""
-        self.auto_light.set_manual_gamma(gamma)
-
-    @property
-    def target_luminance(self) -> float:
-        return self.auto_light.target_luminance
-
-    def set_target_luminance(self, target: float) -> None:
-        """Set target luminance for Auto-Light Boost."""
-        self.auto_light.set_target_luminance(target)
-
-    @property
-    def blur_level(self) -> int:
-        return self.segmentation.tier
-
-    @blur_level.setter
-    def blur_level(self, val: int) -> None:
-        self.segmentation.set_tier(val)
-
-    def set_blur_tier(self, tier: int) -> None:
-        """Set background blur tier (0-3)."""
-        self.segmentation.set_tier(tier)
-
-    @property
-    def blur_intensity(self) -> int:
-        return self.segmentation.intensity
-
-    def set_blur_intensity(self, intensity: int) -> None:
-        """Set continuous background blur intensity (0-100)."""
-        self.segmentation.set_intensity(intensity)
-
-    def crop_center_square(self, frame: np.ndarray) -> np.ndarray:
-        """Center-crop frame into an exact 1:1 aspect ratio square."""
+    def _update_autoframe(self, frame: np.ndarray) -> None:
+        if not self.auto_frame or not self.segmentation.is_neural:
+            return
+        if self._frame_index % AUTOFRAME_EVERY_N != 0:
+            return
         h, w = frame.shape[:2]
-        if h == w:
-            return frame
+        # Letterbox to a square so the model sees undistorted proportions.
+        side = max(h, w)
+        square = np.zeros((side, side, 3), dtype=np.uint8)
+        y0, x0 = (side - h) // 2, (side - w) // 2
+        square[y0 : y0 + h, x0 : x0 + w] = frame
+        raw = self.segmentation.infer_raw(square)
+        mh, mw = raw.shape[:2]
+        sy0, sx0 = int(y0 / side * mh), int(x0 / side * mw)
+        sy1, sx1 = int((y0 + h) / side * mh), int((x0 + w) / side * mw)
+        mask = raw[sy0:sy1, sx0:sx1]
+        crop = compute_crop(w, h, self._output_size[0] / self._output_size[1], zoom=self.zoom)
+        self.framer.update(mask, w, h, crop.h)
 
-        dim = min(h, w)
-        start_x = (w - dim) // 2
-        start_y = (h - dim) // 2
-        return frame[start_y : start_y + dim, start_x : start_x + dim]
+    @property
+    def auto_light_source(self) -> str:
+        """What auto light can meter on: 'face', 'person' or 'center'."""
+        if self.face.available:
+            return "face"
+        return "person" if self.segmentation.is_neural else "center"
+
+    def _update_meter(self, out: np.ndarray) -> None:
+        """Decide what auto light meters on (runs before light & color are applied)."""
+        # Offset by one so face detection never lands on a frame where the background
+        # model runs (it infers on even frames) and the two costs never stack.
+        if self._frame_index % METER_EVERY_N != 1 and self._meter is not None:
+            return
+        if self.face.available:
+            boxes = self.face.detect(out)
+            if boxes:
+                self._meter = ("face", boxes)
+                self._face_misses = 0
+                return
+            self._face_misses += 1
+            if self._meter is not None and self._meter[0] == "face" and self._face_misses <= FACE_HOLD_FRAMES:
+                return
+        if self.segmentation.is_neural:
+            if self.needs_mask and self._last_mask is not None:
+                self._meter = ("person", self._last_mask)
+            elif self._frame_index % (2 * METER_EVERY_N) == 0 or self._meter is None:
+                self._meter = ("person", self.segmentation.infer_raw(out))
+            return
+        self._meter = None
 
     def process(self, frame: np.ndarray) -> np.ndarray:
-        """Run full processing pipeline: mirror -> auto-light -> center-crop -> blur."""
+        """Return BGR (opaque) or BGRA (background removed) at output size."""
         if frame is None or frame.size == 0:
             return frame
+        with self._lock:
+            t0 = time.perf_counter()
+            self._frame_index += 1
+            if frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-        # 1. Horizontal mirror
-        if self.mirror_enabled:
-            frame = cv2.flip(frame, 1)
+            self._update_autoframe(frame)
+            fh, fw = frame.shape[:2]
+            r = self.crop_rect(fw, fh)
+            crop = frame[r.y : r.y + r.h, r.x : r.x + r.w]
+            ow, oh = self._output_size
+            # Halve with a Gaussian pyramid (cheap, alias-free) before the final linear resize.
+            while crop.shape[1] >= 2 * ow and crop.shape[0] >= 2 * oh:
+                crop = cv2.pyrDown(crop)
+            out = cv2.resize(crop, (ow, oh), interpolation=cv2.INTER_LINEAR)
+            if self.mirror:
+                # Mirror the small output instead of the full camera frame.
+                out = cv2.flip(out, 1)
+            t1 = time.perf_counter()
 
-        # 2. Real-time Auto-Light Boost
-        frame = self.auto_light.process(frame)
+            if self.adjuster.auto_light:
+                self._update_meter(out)
+            out = self.adjuster.process(out, self._meter if self.adjuster.auto_light else None)
+            t2 = time.perf_counter()
 
-        # 3. Aspect-ratio locked 1:1 center crop (removes unseen outer pixels before blur)
-        square_frame = self.crop_center_square(frame)
+            if self.needs_mask:
+                mask = self.segmentation.mask(out, ow, oh)
+                self._last_mask = mask
+                out = self.compositor.composite(out, mask, self.background_mode, self.blur_strength, self.background_color)
+            t3 = time.perf_counter()
+            self.last_timings = {
+                "crop_ms": (t1 - t0) * 1000,
+                "adjust_ms": (t2 - t1) * 1000,
+                "background_ms": (t3 - t2) * 1000,
+                "total_ms": (t3 - t0) * 1000,
+            }
+            return out
 
-        # 4. Offline 3-tier bokeh background blur on 1:1 square
-        if self.segmentation.tier != 0:
-            square_frame = self.segmentation.process(square_frame)
 
-        return square_frame
+def to_qimage(processed: np.ndarray):
+    """Convert a processed BGR/BGRA frame to a detached QImage."""
+    from PySide6.QtGui import QImage
 
-    def process_to_qimage(self, frame: np.ndarray) -> QImage:
-        """Process frame and convert directly to a QImage suitable for QPainter rendering."""
-        processed = self.process(frame)
-
-        # Convert BGR to RGB for Qt rendering
-        rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-
-        # Create QImage wrapping numpy buffer
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
-        return qimg
+    h, w = processed.shape[:2]
+    if processed.ndim == 3 and processed.shape[2] == 4:
+        rgba = cv2.cvtColor(processed, cv2.COLOR_BGRA2RGBA)
+        return QImage(rgba.data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
+    rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+    return QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()

@@ -1,26 +1,47 @@
-"""Threaded camera capture worker with atomic depth-1 frame queue and V4L2 backend."""
+"""Camera worker: V4L2 capture + processing off the GUI thread, with auto-reconnect.
+
+The worker owns a :class:`FrameProcessor`. Each processed frame is placed in a
+single-slot mailbox; the GUI is notified only when it has consumed the previous
+frame, so a slow UI never builds up a queue of stale frames.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 from typing import Optional, Tuple
+
 import cv2
 import numpy as np
-from PySide6.QtCore import QMutex, QMutexLocker, QThread, Signal
+from PySide6.QtCore import QThread, Signal
+from PySide6.QtGui import QImage
+
+from selficamera.processor.pipeline import FrameProcessor, to_qimage
 
 logger = logging.getLogger(__name__)
 
+RETRY_INTERVAL_S = 2.0
+MAX_READ_FAILURES = 8
 
-class CameraCaptureWorker(QThread):
-    """Background QThread for non-blocking V4L2 camera capture."""
 
-    frame_ready = Signal(np.ndarray)
-    error_occurred = Signal(str)
-    device_changed = Signal(str, int, int)
+class CameraStatus:
+    STARTING = "starting"
+    LIVE = "live"
+    ERROR = "error"
+
+
+class CameraWorker(QThread):
+    """Background thread capturing, processing and publishing frames."""
+
+    frame_available = Signal()
+    status_changed = Signal(str, str)  # (state, human readable message)
+    fps_measured = Signal(float)
 
     def __init__(
         self,
+        processor: FrameProcessor,
         device_path: str = "/dev/video0",
         width: int = 1280,
         height: int = 720,
@@ -28,170 +49,198 @@ class CameraCaptureWorker(QThread):
         mock_mode: bool = False,
     ) -> None:
         super().__init__()
+        self.processor = processor
         self.device_path = device_path
-        self.width = width
-        self.height = height
-        self.fps = max(1, fps)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(1, int(fps))
         self.mock_mode = mock_mode
 
         self._running = False
         self._cap: Optional[cv2.VideoCapture] = None
-        self._mutex = QMutex()
-        self._consecutive_errors = 0
-        self._mock_frame_counter = 0
+        self._lock = threading.Lock()
+        self._pending_change: Optional[Tuple[str, int, int, int]] = None
+        self._latest: Optional[QImage] = None
+        self._notified = False
+        self._mock_counter = 0
+        self._paused = False
+        self.state = CameraStatus.STARTING
+        self.actual_resolution: Tuple[int, int] = (self.width, self.height)
 
-        # Pending device change request
-        self._pending_change: Optional[Tuple[str, int, int]] = None
+    # ----------------------------------------------------------------- control
+    def change_source(self, device_path: str, width: int, height: int, fps: int) -> None:
+        with self._lock:
+            self._pending_change = (device_path, int(width), int(height), max(1, int(fps)))
 
-    def change_device(self, new_device_path: str, width: int = 1280, height: int = 720) -> None:
-        """Schedule a clean switch to a new camera device or resolution."""
-        with QMutexLocker(self._mutex):
-            self._pending_change = (new_device_path, width, height)
+    def change_device(self, device_path: str, width: int = 1280, height: int = 720) -> None:
+        self.change_source(device_path, width, height, self.fps)
+
+    def set_paused(self, paused: bool) -> None:
+        """Pause capture (e.g. while the bubble is hidden) to free the camera and CPU."""
+        self._paused = paused
 
     def stop(self) -> None:
-        """Gracefully stop the worker thread."""
         self._running = False
-        self.wait(1500)
+        self.wait(3000)
 
-    def _open_camera(self) -> bool:
-        """Open V4L2 device descriptor and apply properties."""
+    def take_frame(self) -> Optional[QImage]:
+        """Called from the GUI thread to fetch the newest frame."""
+        with self._lock:
+            img = self._latest
+            self._latest = None
+            self._notified = False
+            return img
+
+    # --------------------------------------------------------------- internals
+    def _set_status(self, state: str, message: str) -> None:
+        if state != self.state or state == CameraStatus.ERROR:
+            self.state = state
+            self.status_changed.emit(state, message)
+
+    def _release(self) -> None:
         if self._cap is not None:
-            self._cap.release()
+            try:
+                self._cap.release()
+            except Exception:
+                pass
             self._cap = None
 
+    def _open(self) -> bool:
+        self._release()
         if self.mock_mode:
-            logger.info("Operating in mock camera mode (synthetic test feed).")
+            self._set_status(CameraStatus.LIVE, "Demo feed")
             return True
-
-        device_index = 0
-        if "video" in self.device_path:
-            digits = "".join(filter(str.isdigit, self.device_path))
-            if digits:
-                device_index = int(digits)
-
-        try:
-            self._cap = cv2.VideoCapture(device_index, cv2.CAP_V4L2)
-            if not self._cap.isOpened():
-                # Fallback to default backend
-                self._cap = cv2.VideoCapture(device_index)
-
-            if not self._cap.isOpened():
-                msg = f"Cannot open camera device {self.device_path} (index {device_index})"
-                logger.error(msg)
-                self.error_occurred.emit(msg)
-                return False
-
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            self._cap.set(cv2.CAP_PROP_FPS, self.fps)
-            # Try MJPG hardware decompression
-            fourcc_mjpg = cv2.VideoWriter_fourcc(*"MJPG")
-            self._cap.set(cv2.CAP_PROP_FOURCC, fourcc_mjpg)
-
-            actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            logger.info("Camera opened: %s at %dx%d (requested %dx%d)", self.device_path, actual_w, actual_h, self.width, self.height)
-            return True
-        except Exception as e:
-            msg = f"Exception opening camera {self.device_path}: {e}"
-            logger.error(msg)
-            self.error_occurred.emit(msg)
+        if not os.path.exists(self.device_path):
+            self._set_status(CameraStatus.ERROR, "Camera not found.\nPlug it in or pick another in Settings.")
             return False
+        if not os.access(self.device_path, os.R_OK | os.W_OK):
+            self._set_status(CameraStatus.ERROR, "No permission to use the camera.\nAdd your user to the 'video' group.")
+            return False
+        cap = cv2.VideoCapture(self.device_path, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            self._set_status(CameraStatus.ERROR, "Camera is busy or disconnected.\nRetrying…")
+            return False
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.actual_resolution = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        logger.info(
+            "Camera %s opened at %dx%d (requested %dx%d @ %d fps)",
+            self.device_path,
+            *self.actual_resolution,
+            self.width,
+            self.height,
+            self.fps,
+        )
+        self._cap = cap
+        self._set_status(CameraStatus.STARTING, "Starting camera…")
+        return True
 
-    def _generate_mock_frame(self) -> np.ndarray:
-        """Generate synthetic 1280x720 BGR test frame with moving target and timestamp."""
-        frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-
-        # Dynamic gradient background
-        y_coords = np.linspace(30, 80, self.height, dtype=np.uint8)[:, None]
-        frame[:, :, 0] = y_coords
-        frame[:, :, 1] = 45
-        frame[:, :, 2] = 60
-
-        # Synthetic presenter avatar (centered circle)
-        cx = self.width // 2
-        cy = self.height // 2
-        radius = min(self.width, self.height) // 3
-
-        # Draw head & shoulders simulation
-        cv2.circle(frame, (cx, cy - 20), radius // 2, (180, 150, 140), -1)
-        cv2.ellipse(frame, (cx, cy + radius // 2), (radius // 2 + 60, radius // 2), 0, 0, 360, (120, 80, 70), -1)
-
-        # Moving indicator dot
-        self._mock_frame_counter += 1
-        indicator_x = int(cx + (radius // 2) * np.sin(self._mock_frame_counter * 0.1))
-        cv2.circle(frame, (indicator_x, cy - 100), 12, (0, 230, 255), -1)
-
-        # Status text
-        cv2.putText(frame, f"Mock V4L2 Feed #{self._mock_frame_counter}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        cv2.putText(frame, f"Target: {self.width}x{self.height} @ {self.fps}fps", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
-
+    def generate_mock_frame(self) -> np.ndarray:
+        """Synthetic presenter feed for demos and tests."""
+        self._mock_counter += 1
+        w, h = self.width, self.height
+        t = self._mock_counter / max(1, self.fps)
+        yy = np.linspace(0, 1, h, dtype=np.float32)[:, None]
+        xx = np.linspace(0, 1, w, dtype=np.float32)[None, :]
+        frame = np.empty((h, w, 3), dtype=np.uint8)
+        frame[..., 0] = (90 + 60 * yy + 20 * xx).astype(np.uint8)
+        frame[..., 1] = (70 + 40 * xx).astype(np.uint8)
+        frame[..., 2] = (60 + 30 * yy).astype(np.uint8)
+        for i in range(6):  # bookshelf-ish background detail
+            x0 = int(w * (0.05 + i * 0.16))
+            cv2.rectangle(frame, (x0, int(h * 0.12)), (x0 + int(w * 0.09), int(h * 0.42)), (40 + i * 25, 120, 200 - i * 20), -1)
+        cx = int(w / 2 + np.sin(t * 0.7) * w * 0.06)
+        cy = int(h * 0.48)
+        r = min(w, h) // 3
+        cv2.ellipse(frame, (cx, h), (int(r * 1.15), int(r * 0.85)), 0, 180, 360, (95, 70, 60), -1)
+        cv2.circle(frame, (cx, cy), int(r * 0.55), (150, 175, 220), -1)
+        cv2.ellipse(frame, (cx, cy - int(r * 0.28)), (int(r * 0.58), int(r * 0.34)), 0, 180, 360, (40, 45, 60), -1)
+        eye_dy = int(r * 0.05)
+        for dx in (-int(r * 0.2), int(r * 0.2)):
+            cv2.circle(frame, (cx + dx, cy - eye_dy), max(2, r // 22), (40, 30, 30), -1)
+        cv2.ellipse(frame, (cx, cy + int(r * 0.2)), (int(r * 0.16), int(r * 0.07)), 0, 0, 180, (60, 60, 160), 3)
         return frame
 
-    def run(self) -> None:
-        """Main acquisition loop."""
-        self._running = True
-        self._open_camera()
+    def _publish(self, raw: np.ndarray) -> None:
+        processed = self.processor.process(raw)
+        qimg = to_qimage(processed)
+        notify = False
+        with self._lock:
+            self._latest = qimg
+            if not self._notified:
+                self._notified = True
+                notify = True
+        if notify:
+            self.frame_available.emit()
 
-        frame_interval = 1.0 / self.fps
+    def run(self) -> None:  # noqa: C901 - main loop
+        self._running = True
+        self._open()
+        failures = 0
+        last_retry = time.monotonic()
+        fps_window_start = time.monotonic()
+        fps_frames = 0
+        interval = 1.0 / self.fps
 
         while self._running:
-            loop_start = time.perf_counter()
+            loop_start = time.monotonic()
 
-            # Handle dynamic device / resolution switch
-            with QMutexLocker(self._mutex):
-                if self._pending_change is not None:
-                    new_dev, new_w, new_h = self._pending_change
-                    self._pending_change = None
-                    self.device_path = new_dev
-                    self.width = new_w
-                    self.height = new_h
-                    self._open_camera()
-                    self.device_changed.emit(self.device_path, self.width, self.height)
+            with self._lock:
+                change = self._pending_change
+                self._pending_change = None
+            if change is not None:
+                self.device_path, self.width, self.height, self.fps = change
+                interval = 1.0 / self.fps
+                self.processor.framer.reset()
+                self._open()
+                failures = 0
 
-            if self.mock_mode or self._cap is None:
-                frame = self._generate_mock_frame()
-                self.frame_ready.emit(frame)
-                elapsed = time.perf_counter() - loop_start
-                sleep_time = max(0.001, frame_interval - elapsed)
-                self.msleep(int(sleep_time * 1000))
+            if self._paused:
+                if self._cap is not None:
+                    self._release()
+                self.msleep(100)
                 continue
 
-            ret, frame = self._cap.read()
-            if not ret or frame is None:
-                self._consecutive_errors += 1
-                if self._consecutive_errors >= 3:
-                    msg = f"Camera read failed consecutively for {self.device_path}"
-                    logger.warning(msg)
-                    self.error_occurred.emit(msg)
-                    # Produce clean fallback placeholder
-                    placeholder = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-                    cv2.putText(
-                        placeholder,
-                        "Camera Unavailable",
-                        (self.width // 4, self.height // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2,
-                        (0, 0, 255),
-                        2,
-                    )
-                    self.frame_ready.emit(placeholder)
-                self.msleep(30)
+            if self.mock_mode:
+                self._publish(self.generate_mock_frame())
+                self._set_status(CameraStatus.LIVE, "Demo feed")
+                elapsed = time.monotonic() - loop_start
+                self.msleep(max(1, int((interval - elapsed) * 1000)))
+            elif self._cap is None:
+                if time.monotonic() - last_retry >= RETRY_INTERVAL_S:
+                    last_retry = time.monotonic()
+                    self._open()
+                else:
+                    self.msleep(100)
                 continue
+            else:
+                ok, frame = self._cap.read()
+                if not ok or frame is None:
+                    failures += 1
+                    if failures >= MAX_READ_FAILURES:
+                        logger.warning("Camera %s stopped delivering frames; reconnecting.", self.device_path)
+                        self._release()
+                        self._set_status(CameraStatus.ERROR, "Camera disconnected.\nRetrying…")
+                        last_retry = time.monotonic()
+                    else:
+                        self.msleep(20)
+                    continue
+                failures = 0
+                try:
+                    self._publish(frame)
+                except Exception:
+                    logger.exception("Frame processing failed")
+                    continue
+                self._set_status(CameraStatus.LIVE, "")
 
-            self._consecutive_errors = 0
-            # Emit frame immediately (atomic depth-1 queue semantics: downstream slot uses it immediately)
-            self.frame_ready.emit(frame)
+            fps_frames += 1
+            now = time.monotonic()
+            if now - fps_window_start >= 2.0:
+                self.fps_measured.emit(fps_frames / (now - fps_window_start))
+                fps_window_start, fps_frames = now, 0
 
-            # Throttle if acquisition completes faster than target framerate
-            elapsed = time.perf_counter() - loop_start
-            if elapsed < frame_interval:
-                sleep_ms = int((frame_interval - elapsed) * 1000)
-                if sleep_ms > 0:
-                    self.msleep(sleep_ms)
-
-        # Clean shutdown
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
-        logger.info("Camera capture worker terminated cleanly.")
+        self._release()
+        logger.info("Camera worker stopped.")

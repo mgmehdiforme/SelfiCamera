@@ -1,0 +1,2 @@
+# Runs the MediaPipe Selfie Segmenter (.tflite) used for AI background effects.
+ai-edge-litert>=1.0

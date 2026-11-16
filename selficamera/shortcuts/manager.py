@@ -1,138 +1,115 @@
-"""Dual-mode shortcut coordinator supporting X11 global grabs and Wayland IPC."""
+"""Global shortcuts: X11 key grabs plus the IPC server (used by GNOME Wayland keybindings)."""
 
 from __future__ import annotations
 
 import logging
 import os
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
+
 from PySide6.QtCore import QObject, Signal
 
-from selficamera.shortcuts.ipc import ShortcutIPCServer
+from selficamera.shortcuts.ipc import ShortcutIPCServer, Validator
 
 logger = logging.getLogger(__name__)
 
+# key -> (action, params). Combined with Super+Alt.
+HOTKEYS: Dict[str, Tuple[str, Dict[str, Any]]] = {
+    "c": ("toggle_visibility", {}),
+    "z": ("toggle_spotlight", {}),
+    "b": ("cycle_background", {}),
+    "m": ("toggle_mirror", {}),
+    "x": ("toggle_ghost", {}),
+    "o": ("toggle_settings", {}),
+    "1": ("snap", {"position": 1}),
+    "2": ("snap", {"position": 2}),
+    "3": ("snap", {"position": 3}),
+    "4": ("snap", {"position": 4}),
+    "5": ("snap", {"position": 5}),
+}
+
 
 class ShortcutManager(QObject):
-    """Coordinates system-wide presenter hotkeys across Wayland and X11 sessions."""
+    """Emits ``action_requested(action, params)`` on the GUI thread for every trigger."""
 
-    toggle_visibility_requested = Signal()
-    toggle_ghost_requested = Signal()
-    toggle_settings_requested = Signal()
-    snap_corner_requested = Signal(int)
-    cycle_blur_requested = Signal()
-    quit_requested = Signal()
+    action_requested = Signal(str, dict)
 
     def __init__(
         self,
         state_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         socket_path: Optional[str] = None,
+        validator: Optional[Validator] = None,
+        enable_x11: bool = True,
     ) -> None:
         super().__init__()
-        self.state_provider = state_provider
-        self.ipc_server = ShortcutIPCServer(state_provider=state_provider, socket_path=socket_path)
-        self.ipc_server.action_received.connect(self._handle_ipc_action)
-
+        self.ipc_server = ShortcutIPCServer(state_provider=state_provider, socket_path=socket_path, validator=validator)
+        self.ipc_server.action_received.connect(self.action_requested)
+        self.enable_x11 = enable_x11
         self._x11_thread: Optional[threading.Thread] = None
         self._x11_running = False
+        self._x11_display = None
+        self.x11_active = False
 
     @property
     def is_listening(self) -> bool:
-        """Return True when underlying IPC server is ready."""
         return self.ipc_server.is_listening
 
     def start(self) -> None:
-        """Start IPC server and, if in an X11 session, initialize X11 key grabber."""
         self.ipc_server.start()
-
-        session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
-        has_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
-        is_x11 = session_type == "x11" or (not has_wayland and bool(os.environ.get("DISPLAY")))
-
-        if is_x11:
-            self._start_x11_grabber()
+        session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        is_x11 = session == "x11" or (not os.environ.get("WAYLAND_DISPLAY") and bool(os.environ.get("DISPLAY")))
+        if self.enable_x11 and is_x11:
+            self._start_x11()
         else:
-            logger.info("Session is Wayland (or headless). Relying on Unix domain socket IPC for shortcuts.")
+            logger.info("Global keys via desktop keybindings + IPC (Wayland or headless session).")
 
     def stop(self) -> None:
-        """Stop IPC server and X11 thread."""
-        self.ipc_server.stop()
         self._x11_running = False
+        if self._x11_display is not None:
+            try:
+                self._x11_display.close()
+            except Exception:
+                pass
+        self.ipc_server.stop()
 
-    def _handle_ipc_action(self, action: str, params: dict) -> None:
-        """Route IPC actions to corresponding Qt signals."""
-        logger.info("ShortcutManager handling action: %s (params: %s)", action, params)
-
-        if action in ("toggle_visibility", "toggle"):
-            self.toggle_visibility_requested.emit()
-        elif action in ("toggle_ghost", "ghost"):
-            self.toggle_ghost_requested.emit()
-        elif action in ("toggle_settings", "settings"):
-            self.toggle_settings_requested.emit()
-        elif action in ("snap_corner", "snap"):
-            corner = int(params.get("corner", 4))
-            self.snap_corner_requested.emit(corner)
-        elif action in ("cycle_blur", "blur_cycle"):
-            self.cycle_blur_requested.emit()
-        elif action in ("quit", "exit"):
-            self.quit_requested.emit()
-
-    def _start_x11_grabber(self) -> None:
-        """Start background X11 key grab listener using python-xlib if available."""
+    def _start_x11(self) -> None:
         try:
             from Xlib import X, XK
             from Xlib.display import Display
-
+        except ImportError:
+            logger.info("python-xlib not installed; X11 global keys disabled.")
+            return
+        try:
             display = Display()
             root = display.screen().root
+            base = X.Mod4Mask | X.Mod1Mask
+            keymap: Dict[int, Tuple[str, Dict[str, Any]]] = {}
+            for key, action in HOTKEYS.items():
+                keycode = display.keysym_to_keycode(XK.string_to_keysym(key))
+                if not keycode:
+                    continue
+                for extra in (0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask):
+                    root.grab_key(keycode, base | extra, True, X.GrabModeAsync, X.GrabModeAsync)
+                keymap[keycode] = action
+            display.sync()
+        except Exception as exc:
+            logger.info("X11 key grab unavailable (%s).", exc)
+            return
 
-            # Key combinations: Super+Alt+C, Super+Alt+X, Super+Alt+B, Super+Alt+1..4
-            # Modifiers: Mod4 (Super) + Mod1 (Alt)
-            mod_mask = X.Mod4Mask | X.Mod1Mask
+        self._x11_display = display
+        self._x11_running = True
+        self.x11_active = True
 
-            def register_key(keysym_name: str) -> Optional[int]:
-                keysym = XK.string_to_keysym(keysym_name)
-                if not keysym:
-                    return None
-                keycode = display.keysym_to_keycode(keysym)
-                if keycode:
-                    root.grab_key(keycode, mod_mask, 1, X.GrabModeAsync, X.GrabModeAsync)
-                    # Also grab with NumLock and CapsLock combinations
-                    root.grab_key(keycode, mod_mask | X.Mod2Mask, 1, X.GrabModeAsync, X.GrabModeAsync)
-                    root.grab_key(keycode, mod_mask | X.LockMask, 1, X.GrabModeAsync, X.GrabModeAsync)
-                return keycode
+        def loop() -> None:
+            while self._x11_running:
+                try:
+                    event = display.next_event()
+                except Exception:
+                    break
+                if event.type == X.KeyPress and event.detail in keymap:
+                    action, params = keymap[event.detail]
+                    self.action_requested.emit(action, dict(params))
 
-            key_map = {
-                register_key("c"): lambda: self.toggle_visibility_requested.emit(),
-                register_key("C"): lambda: self.toggle_visibility_requested.emit(),
-                register_key("x"): lambda: self.toggle_ghost_requested.emit(),
-                register_key("X"): lambda: self.toggle_ghost_requested.emit(),
-                register_key("b"): lambda: self.cycle_blur_requested.emit(),
-                register_key("B"): lambda: self.cycle_blur_requested.emit(),
-                register_key("s"): lambda: self.toggle_settings_requested.emit(),
-                register_key("S"): lambda: self.toggle_settings_requested.emit(),
-                register_key("1"): lambda: self.snap_corner_requested.emit(1),
-                register_key("2"): lambda: self.snap_corner_requested.emit(2),
-                register_key("3"): lambda: self.snap_corner_requested.emit(3),
-                register_key("4"): lambda: self.snap_corner_requested.emit(4),
-                register_key("5"): lambda: self.snap_corner_requested.emit(5),
-            }
-
-            self._x11_running = True
-
-            def x11_loop():
-                while self._x11_running:
-                    try:
-                        event = display.next_event()
-                        if event.type == X.KeyPress and event.detail in key_map:
-                            cb = key_map[event.detail]
-                            if cb:
-                                cb()
-                    except Exception:
-                        break
-
-            self._x11_thread = threading.Thread(target=x11_loop, daemon=True)
-            self._x11_thread.start()
-            logger.info("X11 Global hotkeys registered successfully via python-xlib.")
-        except Exception as e:
-            logger.info("Native X11 key grabber bypassed (%s). IPC socket active.", e)
+        self._x11_thread = threading.Thread(target=loop, name="x11-hotkeys", daemon=True)
+        self._x11_thread.start()
+        logger.info("X11 global hotkeys registered (Super+Alt+…).")

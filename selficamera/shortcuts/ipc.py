@@ -1,4 +1,4 @@
-"""Unix Domain Socket IPC server and client for presenter shortcut triggers and CLI control."""
+"""Unix-domain-socket IPC server used by hotkeys, the CLI and automation tools."""
 
 from __future__ import annotations
 
@@ -8,145 +8,111 @@ import os
 import socket
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
-from PySide6.QtCore import QObject, QThread, Signal
+
+from PySide6.QtCore import QThread, Signal
+
+from selficamera.ipc_client import ShortcutIPCClient, get_ipc_socket_path, send_command
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["ShortcutIPCServer", "ShortcutIPCClient", "get_ipc_socket_path", "send_command"]
 
-def get_ipc_socket_path() -> Path:
-    """Resolve standard XDG runtime directory Unix domain socket path."""
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime_dir and os.path.exists(runtime_dir):
-        return Path(runtime_dir) / "selficamera.sock"
-
-    uid = os.getuid()
-    return Path(f"/tmp/selficamera-{uid}.sock")
-
-
-class ShortcutIPCClient:
-    """CLI client connecting to running SelfiCamera instance via Unix domain socket."""
-
-    @classmethod
-    def send_command(
-        cls,
-        action: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout: float = 1.0,
-        socket_path: Optional[Path | str] = None,
-    ) -> Dict[str, Any]:
-        """Send a single JSON command to the running daemon and return the JSON response."""
-        sock_path = Path(socket_path) if socket_path else get_ipc_socket_path()
-        if not sock_path.exists():
-            return {
-                "success": False,
-                "error": f"No active SelfiCamera instance detected (socket {sock_path} does not exist)",
-            }
-
-        client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client_sock.settimeout(timeout)
-
-        try:
-            client_sock.connect(str(sock_path))
-            payload = json.dumps({"action": action, "params": params or {}}) + "\n"
-            client_sock.sendall(payload.encode("utf-8"))
-
-            response_data = b""
-            while b"\n" not in response_data:
-                chunk = client_sock.recv(4096)
-                if not chunk:
-                    break
-                response_data += chunk
-
-            if not response_data:
-                return {"success": False, "error": "Server closed connection without responding"}
-
-            return json.loads(response_data.decode("utf-8"))
-        except (ConnectionRefusedError, FileNotFoundError):
-            # Clean up stale socket file left from an ungracefully terminated process
-            try:
-                if sock_path.exists():
-                    sock_path.unlink()
-            except OSError:
-                pass
-            return {
-                "success": False,
-                "error": "No active SelfiCamera instance detected (server is not running)",
-            }
-        except Exception as e:
-            if getattr(e, "errno", None) == 111 or "111" in str(e):
-                try:
-                    if sock_path.exists():
-                        sock_path.unlink()
-                except OSError:
-                    pass
-                return {
-                    "success": False,
-                    "error": "No active SelfiCamera instance detected (server is not running)",
-                }
-            return {"success": False, "error": str(e)}
-        finally:
-            try:
-                client_sock.close()
-            except Exception:
-                pass
+Validator = Callable[[str, Dict[str, Any]], Tuple[bool, str]]
 
 
 class ShortcutIPCServer(QThread):
-    """Listens on Unix Domain Socket in background and dispatches action signals."""
+    """Accepts one JSON request per connection and forwards it to the GUI thread."""
 
-    action_received = Signal(str, dict)  # (action, params)
+    action_received = Signal(str, dict)
     started_listening = Signal()
 
     def __init__(
         self,
         state_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         socket_path: Optional[Path | str] = None,
+        validator: Optional[Validator] = None,
     ) -> None:
         super().__init__()
         self.socket_path = Path(socket_path) if socket_path else get_ipc_socket_path()
         self.state_provider = state_provider
+        self.validator = validator
         self._running = False
         self._is_listening = False
         self._server_sock: Optional[socket.socket] = None
 
     @property
     def is_listening(self) -> bool:
-        """Return True if the server socket is bound, listening, and ready for connections."""
         return self._is_listening
 
-    def run(self) -> None:
-        """Bind socket, set permissions 0600, and accept client connections."""
-        self._running = True
-
-        # Clean stale socket if dead
+    def _bind(self) -> bool:
         if self.socket_path.exists():
-            # Test if another instance is alive
-            test_res = ShortcutIPCClient.send_command("ping", timeout=0.08, socket_path=self.socket_path)
-            if test_res.get("success"):
-                logger.error("Another active SelfiCamera instance is already listening on %s", self.socket_path)
-                return
+            if send_command("ping", timeout=0.2, socket_path=self.socket_path).get("success"):
+                logger.error("Another SelfiCamera instance owns %s", self.socket_path)
+                return False
             try:
                 self.socket_path.unlink()
             except OSError:
                 pass
-
         try:
-            if self.socket_path.exists():
-                self.socket_path.unlink()
-            self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._server_sock.bind(str(self.socket_path))
-            # Restrict permissions to owner only (0600)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            old_umask = os.umask(0o177)
+            try:
+                sock.bind(str(self.socket_path))
+            finally:
+                os.umask(old_umask)
             os.chmod(self.socket_path, 0o600)
-            self._server_sock.listen(5)
-            self._server_sock.settimeout(0.5)
+            sock.listen(8)
+            sock.settimeout(0.3)
+            self._server_sock = sock
             self._is_listening = True
             self.started_listening.emit()
-            logger.info("IPC Server bound to %s (permissions 0600)", self.socket_path)
-        except Exception as e:
-            logger.error("Failed to bind IPC socket %s: %s", self.socket_path, e)
-            self._is_listening = False
+            logger.info("IPC listening on %s", self.socket_path)
+            return True
+        except Exception as exc:
+            logger.error("Cannot bind IPC socket %s: %s", self.socket_path, exc)
+            return False
+
+    def _handle(self, conn: socket.socket) -> None:
+        conn.settimeout(1.0)
+        buffer = b""
+        while b"\n" not in buffer and len(buffer) < 65536:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+        if not buffer:
+            return
+        try:
+            request = json.loads(buffer.decode("utf-8").strip())
+            action = str(request.get("action", ""))
+            params = request.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("params must be an object")
+        except Exception as exc:
+            conn.sendall((json.dumps({"success": False, "error": f"Bad request: {exc}"}) + "\n").encode("utf-8"))
             return
 
+        ok, message = (True, "")
+        if self.validator is not None:
+            ok, message = self.validator(action, params)
+        if ok and action not in ("ping", "get_status", "status"):
+            self.action_received.emit(action, params)
+        state = self.state_provider() if self.state_provider else {}
+        response = {
+            "success": ok,
+            "action": action,
+            "message": message or f"{action}: ok",
+            "state": state,
+        }
+        if not ok:
+            response["error"] = message
+        conn.sendall((json.dumps(response, default=str) + "\n").encode("utf-8"))
+
+    def run(self) -> None:
+        self._running = True
+        if not self._bind():
+            return
+        assert self._server_sock is not None
         while self._running:
             try:
                 conn, _ = self._server_sock.accept()
@@ -154,71 +120,32 @@ class ShortcutIPCServer(QThread):
                 continue
             except OSError:
                 break
-
             try:
-                conn.settimeout(1.0)
-                buffer = b""
-                while b"\n" not in buffer:
-                    chunk = conn.recv(2048)
-                    if not chunk:
-                        break
-                    buffer += chunk
-
-                if buffer:
-                    line = buffer.decode("utf-8").strip()
-                    request = json.loads(line)
-                    action = request.get("action", "")
-                    params = request.get("params", {})
-
-                    # Dispatch to Qt main thread
-                    self.action_received.emit(action, params)
-
-                    # Gather current state
-                    state = self.state_provider() if self.state_provider else {}
-
-                    response = {
-                        "success": True,
-                        "action": action,
-                        "message": f"Action '{action}' executed successfully",
-                        "state": state,
-                    }
-                    conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
-            except Exception as e:
-                err_resp = {"success": False, "error": str(e)}
-                try:
-                    conn.sendall((json.dumps(err_resp) + "\n").encode("utf-8"))
-                except Exception:
-                    pass
+                self._handle(conn)
+            except Exception as exc:
+                logger.debug("IPC connection error: %s", exc)
             finally:
                 try:
                     conn.close()
                 except Exception:
                     pass
+        self._cleanup()
 
-        # Cleanup socket on stop
-        if self._server_sock:
+    def _cleanup(self) -> None:
+        if self._server_sock is not None:
             try:
                 self._server_sock.close()
             except Exception:
                 pass
-        if self.socket_path.exists():
-            try:
+            self._server_sock = None
+        self._is_listening = False
+        try:
+            if self.socket_path.exists():
                 self.socket_path.unlink()
-            except Exception:
-                pass
-        logger.info("IPC Server terminated cleanly.")
+        except OSError:
+            pass
 
     def stop(self) -> None:
-        """Stop listening and cleanly unlink socket file."""
         self._running = False
-        if self._server_sock:
-            try:
-                self._server_sock.close()
-            except Exception:
-                pass
-        self.wait(1500)
-        if self.socket_path.exists():
-            try:
-                self.socket_path.unlink()
-            except Exception:
-                pass
+        self.wait(2000)
+        self._cleanup()

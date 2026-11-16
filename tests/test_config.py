@@ -1,87 +1,137 @@
-"""Tests for Configuration Manager and atomic persistence."""
-
 import json
-from pathlib import Path
-from selficamera.config import DEFAULT_CONFIG, ConfigManager
+
+import pytest
+
+from selficamera.config import (
+    DEFAULT_CONFIG,
+    MAX_SIZE,
+    MIN_SIZE,
+    SCHEMA_VERSION,
+    ConfigManager,
+    migrate,
+    parse_cli_value,
+    validate_value,
+)
 
 
-def test_default_config_loading(temp_config_file: Path):
-    """Verify that default config is returned when file does not exist."""
-    assert not temp_config_file.exists()
-    mgr = ConfigManager(config_path=temp_config_file)
-    assert mgr.get("diameter") == 260
-    assert mgr.get("mirror") is True
-    assert mgr.get("auto_light") is True
-    assert mgr.get("blur_level") == 2
-    assert mgr.get("click_through") is False
-    assert mgr.get("always_on_top") is True
-    assert mgr.get("manual_gamma") == 1.0
-    assert mgr.get("target_luminance") == 125.0
-    assert mgr.get("blur_intensity") == 50
+def test_defaults_when_missing(config_path):
+    cfg = ConfigManager(config_path)
+    assert cfg.as_dict() == DEFAULT_CONFIG
+    assert not config_path.exists()
 
 
-def test_atomic_save_and_reload(temp_config_file: Path):
-    """Verify atomic write persists valid JSON and survives reloading."""
-    mgr = ConfigManager(config_path=temp_config_file)
-    mgr.set("diameter", 380)
-    mgr.set("blur_level", 3)
-    mgr.set("click_through", True)
-
-    assert temp_config_file.exists()
-
-    # Create new instance pointing to same file
-    mgr2 = ConfigManager(config_path=temp_config_file)
-    assert mgr2.get("diameter") == 380
-    assert mgr2.get("blur_level") == 3
-    assert mgr2.get("click_through") is True
+def test_save_and_reload_roundtrip(config_path):
+    cfg = ConfigManager(config_path)
+    cfg.set("shape", "landscape")
+    cfg.set("size", 333)
+    assert cfg.dirty
+    assert cfg.save()
+    assert not cfg.dirty
+    again = ConfigManager(config_path)
+    assert again.get("shape") == "landscape"
+    assert again.get("size") == 333
 
 
-def test_corrupted_config_recovery(temp_config_file: Path):
-    """Verify that corrupted or invalid JSON recovers to default state gracefully."""
-    temp_config_file.parent.mkdir(parents=True, exist_ok=True)
-    temp_config_file.write_text("{ this is corrupted invalid json : [", encoding="utf-8")
-
-    mgr = ConfigManager(config_path=temp_config_file)
-    assert mgr.get("diameter") == 260
-    assert mgr.get("blur_level") == 2
+def test_set_does_not_write_until_save(config_path):
+    cfg = ConfigManager(config_path)
+    cfg.set("brightness", 10)
+    assert not config_path.exists()
+    cfg.save_if_dirty()
+    assert config_path.exists()
 
 
-def test_invalid_value_sanitization(temp_config_file: Path):
-    """Verify that out-of-range diameter or blur level are clamped/reverted to valid defaults."""
-    temp_config_file.parent.mkdir(parents=True, exist_ok=True)
-    bad_data = {
-        "diameter": 9999,  # invalid: outside range [120, 600]
-        "blur_level": -5,  # invalid: must be 0..3
-    }
-    temp_config_file.write_text(json.dumps(bad_data), encoding="utf-8")
-
-    mgr = ConfigManager(config_path=temp_config_file)
-    assert mgr.get("diameter") == 260
-    assert mgr.get("blur_level") == 2
-
-    # Underflow check: diameter < 120
-    temp_config_file.write_text(json.dumps({"diameter": 50}), encoding="utf-8")
-    mgr_under = ConfigManager(config_path=temp_config_file)
-    assert mgr_under.get("diameter") == 260
+@pytest.mark.parametrize(
+    "key,value,expected",
+    [
+        ("size", 50, MIN_SIZE),
+        ("size", 5000, MAX_SIZE),
+        ("zoom", 9, 3.0),
+        ("pan_x", -4, -1.0),
+        ("border_color", "#7c5cff", "#7C5CFF"),
+        ("mirror", "off", False),
+        ("resolution", "1920x1080", [1920, 1080]),
+        ("x", None, None),
+    ],
+)
+def test_validation_normalises(key, value, expected):
+    assert validate_value(key, value) == expected
 
 
-def test_continuous_diameter_range_persistence(temp_config_file: Path):
-    """Verify that any continuous diameter in range [120, 600] is preserved."""
-    mgr = ConfigManager(config_path=temp_config_file)
-    for test_d in [120, 215, 340, 500, 600]:
-        mgr.set("diameter", test_d)
-        reloaded = ConfigManager(config_path=temp_config_file)
-        assert reloaded.get("diameter") == test_d
+@pytest.mark.parametrize(
+    "key,value",
+    [("shape", "hexagon"), ("border_color", "red"), ("background_mode", "sparkles"), ("size", True), ("resolution", [1])],
+)
+def test_validation_rejects(key, value):
+    with pytest.raises(ValueError):
+        validate_value(key, value)
 
 
-def test_update_and_reset(temp_config_file: Path):
-    """Verify batch updates and reset to defaults."""
-    mgr = ConfigManager(config_path=temp_config_file)
-    mgr.update(auto_save=True, diameter=160, mirror=False)
-    assert mgr.get("diameter") == 160
-    assert mgr.get("mirror") is False
+def test_unknown_key_rejected():
+    with pytest.raises(KeyError):
+        validate_value("nope", 1)
 
-    mgr.reset_to_defaults()
-    assert mgr.get("diameter") == DEFAULT_CONFIG["diameter"]
-    assert mgr.get("mirror") == DEFAULT_CONFIG["mirror"]
 
+def test_corrupted_file_falls_back(config_path):
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("{not json")
+    assert ConfigManager(config_path).get("size") == DEFAULT_CONFIG["size"]
+
+
+def test_bad_values_are_dropped_per_key(config_path):
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"version": 2, "shape": "triangle", "size": 300}))
+    cfg = ConfigManager(config_path)
+    assert cfg.get("shape") == "circle"
+    assert cfg.get("size") == 300
+
+
+def test_migrates_v1_config(config_path):
+    config_path.parent.mkdir(parents=True)
+    legacy = {"diameter": 380, "x": 100, "y": 200, "blur_level": 3, "blur_intensity": 85, "aura_enabled": False, "manual_gamma": 1.4}
+    config_path.write_text(json.dumps(legacy))
+    cfg = ConfigManager(config_path)
+    assert cfg.get("size") == 380
+    assert cfg.get("background_mode") == "blur"
+    assert cfg.get("blur_strength") == 85
+    assert cfg.get("voice_glow") is False
+    # v1 stored the window's top-left; v2 stores the bubble center.
+    assert cfg.get("x") == 100 + (380 + 32) // 2
+    assert cfg.get("first_run") is False
+    assert "manual_gamma" not in cfg.as_dict()
+
+
+def test_migrate_noop_for_current_schema():
+    data = {"version": SCHEMA_VERSION, "size": 200}
+    assert migrate(data) == data
+
+
+def test_scenes_save_apply_delete(config_path):
+    cfg = ConfigManager(config_path)
+    cfg.update(shape="portrait", size=300, x=10, y=20)
+    snap = cfg.save_scene("  Shorts  ")
+    assert snap["shape"] == "portrait"
+    assert cfg.scene_names() == ["Shorts"]
+    cfg.set("shape", "circle")
+    assert cfg.get_scene("Shorts")["shape"] == "portrait"
+    assert cfg.delete_scene("Shorts")
+    assert not cfg.delete_scene("Shorts")
+    with pytest.raises(ValueError):
+        cfg.save_scene("   ")
+
+
+def test_reset_keeps_scenes(config_path):
+    cfg = ConfigManager(config_path)
+    cfg.save_scene("Intro")
+    cfg.set("size", 500)
+    cfg.reset_to_defaults()
+    assert cfg.get("size") == DEFAULT_CONFIG["size"]
+    assert cfg.scene_names() == ["Intro"]
+
+
+def test_parse_cli_value_types():
+    assert parse_cli_value("size", "320") == 320
+    assert parse_cli_value("mirror", "false") is False
+    assert parse_cli_value("background_mode", "blur") == "blur"
+    assert parse_cli_value("zoom", "1.5") == 1.5
+    with pytest.raises(ValueError):
+        parse_cli_value("shape", "star")

@@ -1,131 +1,61 @@
-"""End-to-end performance and latency benchmarking suite for SelfiCamera."""
+"""Per-frame latency benchmark for the processing pipeline.
+
+Usage:  python benchmarks/benchmark_pipeline.py [--frames 300]
+Reports p50/p95 per bubble size and background mode, and whether the AI model is active.
+"""
 
 from __future__ import annotations
 
+import argparse
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
-import cv2
-import numpy as np
-import psutil
 
-# Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from selficamera.processor.pipeline import FrameProcessor
+from selficamera.capture.camera import CameraWorker  # noqa: E402
+from selficamera.processor.pipeline import FrameProcessor  # noqa: E402
+from selficamera.ui.shapes import content_size  # noqa: E402
 
-
-def generate_benchmark_frame(width: int = 1280, height: int = 720) -> np.ndarray:
-    """Generate realistic 720p BGR test frame with presenter silhouette."""
-    frame = np.zeros((height, width, 3), dtype=np.uint8)
-    frame[:, :, 0] = np.linspace(40, 80, height, dtype=np.uint8)[:, None]
-    frame[:, :, 1] = 50
-    frame[:, :, 2] = 60
-
-    cx, cy = width // 2, height // 2
-    cv2.circle(frame, (cx, cy - 30), 120, (180, 150, 140), -1)
-    cv2.ellipse(frame, (cx, cy + 220), (220, 150), 0, 0, 360, (120, 80, 70), -1)
-    return frame
+BUDGET_MS = 20.0  # p95 per frame; 30 fps leaves 33 ms
 
 
-def run_benchmark(num_frames: int = 500, blur_tier: int = 2) -> dict:
-    """Execute end-to-end processing across frames, profiling latencies and CPU utilization."""
-    print(f"\n=================================================================")
-    print(f" SelfiCamera Pipeline Benchmark: {num_frames} frames @ 720p (Tier {blur_tier})")
-    print(f"=================================================================")
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--frames", type=int, default=200)
+    ap.add_argument("--dpr", type=float, default=1.0, help="Device pixel ratio of the display")
+    args = ap.parse_args()
 
-    processor = FrameProcessor(mirror=True, auto_light=True, blur_level=blur_tier)
-    test_frame = generate_benchmark_frame()
-
-    # Warmup
-    print("Warming up pipeline (20 frames)...")
-    for _ in range(20):
-        processor.process(test_frame)
-
-    latencies_total = []
-    latencies_mirror = []
-    latencies_light = []
-    latencies_crop = []
-    latencies_seg = []
-
-    process = psutil.Process(os.getpid())
-    cpu_percent_start = process.cpu_percent(interval=None)
-    bench_start_time = time.perf_counter()
-
-    print(f"Running {num_frames} benchmark frames...")
-    for i in range(num_frames):
-        t_start = time.perf_counter()
-
-        # 1. Mirror
-        t0 = time.perf_counter()
-        f_mirrored = cv2.flip(test_frame, 1) if processor.mirror_enabled else test_frame
-        t_mirror = time.perf_counter() - t0
-
-        # 2. Lighting
-        t0 = time.perf_counter()
-        f_lit = processor.auto_light.process(f_mirrored)
-        t_light = time.perf_counter() - t0
-
-        # 3. Center crop to 1:1 square
-        t0 = time.perf_counter()
-        f_cropped = processor.crop_center_square(f_lit)
-        t_crop = time.perf_counter() - t0
-
-        # 4. Segmentation blur on 1:1 square
-        t0 = time.perf_counter()
-        f_blurred = processor.segmentation.process(f_cropped)
-        t_seg = time.perf_counter() - t0
-
-        t_total = time.perf_counter() - t_start
-
-        latencies_total.append(t_total * 1000.0)
-        latencies_mirror.append(t_mirror * 1000.0)
-        latencies_light.append(t_light * 1000.0)
-        latencies_crop.append(t_crop * 1000.0)
-        latencies_seg.append(t_seg * 1000.0)
-
-    bench_elapsed = time.perf_counter() - bench_start_time
-    cpu_percent = process.cpu_percent(interval=None) / psutil.cpu_count(logical=True)
-    fps_achieved = num_frames / bench_elapsed
-
-    stats = {
-        "frames": num_frames,
-        "fps_achieved": fps_achieved,
-        "cpu_percent": cpu_percent,
-        "total_mean": float(np.mean(latencies_total)),
-        "total_median": float(np.median(latencies_total)),
-        "total_p95": float(np.percentile(latencies_total, 95)),
-        "total_max": float(np.max(latencies_total)),
-        "mirror_mean": float(np.mean(latencies_mirror)),
-        "light_mean": float(np.mean(latencies_light)),
-        "crop_mean": float(np.mean(latencies_crop)),
-        "seg_mean": float(np.mean(latencies_seg)),
-    }
-
-    # Print results table
-    print("\n-----------------------------------------------------------------")
-    print(f" Stage Breakdown (Mean Latency):")
-    print(f"   - Horizontal Mirror:    {stats['mirror_mean']:.3f} ms")
-    print(f"   - Auto-Light Boost:     {stats['light_mean']:.3f} ms")
-    print(f"   - 1:1 Center Crop:      {stats['crop_mean']:.3f} ms")
-    print(f"   - Segmentation & Bokeh: {stats['seg_mean']:.3f} ms")
-    print("-----------------------------------------------------------------")
-    print(f" End-to-End Latency Metrics:")
-    print(f"   - Mean Latency:         {stats['total_mean']:.2f} ms")
-    print(f"   - Median (P50) Latency: {stats['total_median']:.2f} ms")
-    print(f"   - 95th Percentile (P95):{stats['total_p95']:.2f} ms")
-    print(f"   - Max Latency:          {stats['total_max']:.2f} ms")
-    print(f"   - Throughput:           {stats['fps_achieved']:.1f} FPS")
-    print(f"   - CPU Utilization:      {stats['cpu_percent']:.1f}%")
-    print("=================================================================\n")
-
-    # Strict latency assertion: 95th percentile must be < 25.0ms (hard limit 30.0ms)
-    assert stats["total_p95"] < 25.0, f"P95 latency {stats['total_p95']:.2f}ms exceeds 25.0ms ceiling!"
-    print("✓ Latency Budget Gate Passed: P95 < 25.0 ms")
-
-    return stats
+    proc = FrameProcessor()
+    feed = CameraWorker(proc, width=1280, height=720, mock_mode=True)
+    frames = [feed.generate_mock_frame() for _ in range(8)]
+    print(f"Segmentation: {proc.segmentation.model_name} ({proc.segmentation.backend_name})")
+    print(f"{'shape':<10} {'size':>5} {'mode':<7} {'avg ms':>8} {'p95 ms':>8}")
+    worst = 0.0
+    for shape, size in (("circle", 260), ("circle", 380), ("landscape", 260), ("portrait", 260)):
+        w, h = content_size(shape, size)
+        proc.set_output_size(int(w * args.dpr), int(h * args.dpr))
+        for mode in ("none", "blur", "remove"):
+            proc.configure(background_mode=mode, auto_light=True)
+            for i in range(10):
+                proc.process(frames[i % len(frames)])
+            samples = []
+            for i in range(args.frames):
+                t = time.perf_counter()
+                proc.process(frames[i % len(frames)])
+                samples.append((time.perf_counter() - t) * 1000)
+            samples.sort()
+            p50 = statistics.mean(samples)
+            p95 = samples[int(len(samples) * 0.95) - 1]
+            worst = max(worst, p95)
+            print(f"{shape:<10} {size:>5} {mode:<7} {p50:>8.2f} {p95:>8.2f}")
+    verdict = "PASS" if worst <= BUDGET_MS else "OVER BUDGET"
+    print(f"\nWorst p95: {worst:.2f} ms (budget {BUDGET_MS} ms) -> {verdict}")
+    return 0 if worst <= BUDGET_MS else 1
 
 
 if __name__ == "__main__":
-    run_benchmark(num_frames=500, blur_tier=2)
+    sys.exit(main())

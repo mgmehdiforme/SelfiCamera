@@ -1,103 +1,151 @@
-# SelfiCamera 📸
+# SelfiCamera
 
-> **Ultra-lightweight, zero-bloat, 100% offline circular presenter camera overlay for Ubuntu Linux (Wayland and X11).**
+**A private, offline webcam overlay for Linux screen recordings and live streams.**
+Put a shaped, framed, branded camera over VS Code, Blender, slides or a browser, and record
+it all with OBS, GNOME's screen recorder, SimpleScreenRecorder or Kazam.
 
-SelfiCamera is built for software engineers, keynote presenters, educators, and live streamers who need a persistent, modern, circular webcam bubble floating above full-screen IDEs, slides, terminals, and browsers without battery drain or privacy compromises.
+- **Shapes:** circle, rounded square, wide 16:9, tall 9:16 (Shorts/Reels)
+- **Background:** blur, solid color (including chroma green for editing), your own image, or **remove** so only you float over the screen
+- **Framing:** zoom, pan and **auto-frame**, which follows you and keeps your head in the upper third
+- **Light & color:** AI auto light that meters on your face (fixes backlit or washed-out faces, leaves a well-lit face alone), plus brightness, contrast, saturation and warmth
+- **Spotlight:** one key grows the camera to the center for intros and outros; the same key sends it back
+- **Scenes:** save looks such as "Intro" or "Tutorial corner" and switch with a click, the tray or a hotkey
+- **Clean recordings:** controls only on hover (or never), no auto-opening windows, Quit is never on the camera
+- **Branding:** border thickness and color, a voice wave that flows around the camera while you talk, drop shadow
+- **Private:** no network access at runtime and no telemetry. The AI models run on your CPU.
+- **Free and open source** (MIT).
 
----
-
-## Key Features
-
-- **Frameless Circular Viewport**: 1:1 aspect-ratio locked video feed clipped cleanly with anti-aliasing and a soft Gaussian drop shadow.
-- **Direct UI Controls & Floating Settings Panel**:
-  - **Auto-Docked Settings Panel**: Starts docked alongside the bubble for effortless mouse-driven configuration without memorizing shortcuts.
-  - **Pinned HUD Capsule (`📌`)**: Quick pill overlay with a 1-click Pin toggle to keep controls permanently visible on screen without fading out.
-  - **Fluid Drag & 1-Click Snapping**: Effortlessly reposition anywhere on screen with automatic desktop boundary clamping and visual cursor feedback (`OpenHand` / `ClosedHand`). 1-click spatial snapping to desktop corners or center (`[↖ TL]`, `[↗ TR]`, `[⏺ Center]`, `[↙ BL]`, `[↘ BR]`).
-  - **Stepped & Continuous Resizing**: Continuous diameter slider (`120px` to `600px`), on-bubble step buttons (`[−]` and `[+]`), mouse scroll-wheel scaling, and standard presets:
-    - **Compact**: 160 px (IDE & terminal walkthroughs)
-    - **Standard**: 260 px (default meeting & presentation mode)
-    - **Focus**: 380 px (keynotes & introductions)
-- **Always-on-Top Persistence**: Stays pinned above active fullscreen applications on both Wayland and X11.
-- **Click-Through Ghost Mode (`Super+Alt+X`)**: Passes all mouse clicks directly through the camera bubble to the code editor underneath.
-- **Offline 4-Tier AI Bokeh Blur**:
-  - **Tier 0 (Off)**: 0ms overhead, bypasses model
-  - **Tier 1 (Subtle)**: ~12px Gaussian blur
-  - **Tier 2 (Balanced)**: ~28px photographic bokeh (downscale-blur-upscale)
-  - **Tier 3 (Heavy)**: ~56px heavy bokeh
-  - Fine-grained intensity slider (0% to 100%) and quick cycling directly from the HUD.
-  - Powered by a local MediaPipe Selfie Segmentation ONNX float32 model (~353KB) running on CPU SIMD with zero cloud dependencies.
-- **Real-Time Light Control**: Quick toggle button on HUD, adaptive Auto-Light Boost, manual Brightness/Gamma slider (`0.40x` to `2.20x`) with `↺ Reset`, and Target Luminance tuning (<1.5ms).
-- **Dynamic Voice Aura Border**: Pulses and glows in real time to speech activity captured via PipeWire / PulseAudio (silence cyan $\rightarrow$ speech blue $\rightarrow$ peak magenta).
-- **Ubuntu System Tray & AppIndicator**: Comprehensive menu for camera device picking, resolution switching (480p, 720p, 1080p), mirror toggle, and clean exit.
+Runs on Ubuntu and other Linux desktops: GNOME (Wayland via XWayland) and X11.
 
 ---
 
-## Presenter Shortcuts & Desktop Integration
+## Install
 
-| Shortcut | Action | Description |
-| :--- | :--- | :--- |
-| `Super+Alt+C` | Toggle Overlay | Show / Hide circular bubble |
-| `Super+Alt+X` | Ghost Mode | Toggle click-through mode |
-| `Super+Alt+1` | Snap Top-Left | Snap bubble to Top-Left desktop corner |
-| `Super+Alt+2` | Snap Top-Right | Snap bubble to Top-Right desktop corner |
-| `Super+Alt+3` | Snap Bottom-Left | Snap bubble to Bottom-Left desktop corner |
-| `Super+Alt+4` | Snap Bottom-Right | Snap bubble to Bottom-Right desktop corner |
-| `Super+Alt+B` | Cycle Blur | Cycle blur tier (Off $\rightarrow$ Subtle $\rightarrow$ Balanced $\rightarrow$ Heavy) |
+One command, no sudo, nothing system-wide:
 
-### GNOME Wayland Shortcut Setup
-On GNOME Wayland sessions, global shortcuts are routed via the local Unix Domain Socket IPC client:
-1. Open **Ubuntu Settings $\rightarrow$ Keyboard $\rightarrow$ Keyboard Shortcuts $\rightarrow$ Custom Shortcuts**.
-2. Add new shortcuts invoking the client:
-   - Name: `SelfiCamera Toggle` | Command: `/path/to/run.sh --toggle` | Shortcut: `Super+Alt+C`
-   - Name: `SelfiCamera Ghost` | Command: `/path/to/run.sh --toggle-ghost` | Shortcut: `Super+Alt+X`
-   - Name: `SelfiCamera Blur Cycle` | Command: `/path/to/run.sh --blur-cycle` | Shortcut: `Super+Alt+B`
-   - Name: `SelfiCamera Snap BR` | Command: `/path/to/run.sh --snap 4` | Shortcut: `Super+Alt+4`
-
----
-
-## Quickstart & Launch
-
-SelfiCamera adheres strictly to Ubuntu standards and isolates all dependencies in a local `.venv`.
-
-### Automated Bootstrap & Run
 ```bash
-git clone https://github.com/your-repo/SelfiCamera.git
-cd SelfiCamera
-
-# Automated one-command bootstrap: provisions .venv and starts application
-./run.sh
+curl -fsSL https://raw.githubusercontent.com/mgmehdiforme/SelfiCamera/main/get.sh | bash
 ```
 
-### CLI Options
+Then open **SelfiCamera** from your apps, or run `selficamera`. The installer:
+
+- downloads SelfiCamera to `~/.local/share/selficamera/app`,
+- builds an isolated Python 3.12 environment with [uv](https://docs.astral.sh/uv/) (installed to `~/.local/bin` if you don't have it),
+- downloads the two offline AI models once (~480 KB, see below),
+- adds SelfiCamera to your app menu and the `selficamera` command to `~/.local/bin`.
+
+It also tells you if two system libraries are missing. On Ubuntu/Debian:
+
 ```bash
-# Launch with synthetic mock video & audio (zero camera/mic hardware required)
-./run.sh --headless-mock
-
-# Launch on a specific V4L2 device at 1080p
-./run.sh --device /dev/video2 --width 1920 --height 1080
-
-# Launch with balanced blur and ghost mode
-./run.sh --blur 2 --ghost
+sudo apt install libxcb-cursor0 libportaudio2
 ```
 
----
+**Update:** run the same command again. **Uninstall:** `bash ~/.local/share/selficamera/app/uninstall.sh`
+(add `--purge` to also delete settings, models and the app folder).
 
-## Automated Testing & Benchmarks
+Add options after `bash -s --`, for example `curl -fsSL …/get.sh | bash -s -- --with-shortcuts --autostart`:
 
-Run the complete test suite headlessly (no physical display or camera needed):
+| Option | What it does |
+|---|---|
+| `--with-shortcuts` | Registers the global shortcuts below as GNOME custom shortcuts. |
+| `--autostart` | Starts SelfiCamera when you log in. |
+
+**AI models** (downloaded once, then everything runs offline on your CPU): Google MediaPipe
+Selfie Segmenter (Apache-2.0) for background effects, and OpenCV YuNet (MIT) so auto light meters on your face.
+
+<details>
+<summary>Install from a git checkout instead</summary>
+
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
-
-# Run full pytest suite with headless Qt
-QT_QPA_PLATFORM=offscreen pytest tests/ -v
-
-# Run 500-frame latency & CPU benchmark
-python benchmarks/benchmark_pipeline.py
+git clone https://github.com/mgmehdiforme/SelfiCamera.git && cd SelfiCamera
+bash install.sh --with-model --with-shortcuts
 ```
 
----
+`install.sh` points the launcher at this checkout. You can also run it without installing: `bash run.sh`.
+</details>
+
+> **Why `libxcb-cursor0`?** GNOME on Wayland only lets apps stay on top and position themselves
+> when they run through XWayland, and Qt needs this library for that. Without it SelfiCamera still
+> runs, but in *limited mode*: it can't stay on top or snap to corners, and it tells you so.
+
+## Use it
+
+- **Move:** drag the camera. **Resize:** scroll over it or drag its edge.
+- **Hover** for quick controls: Background, Mirror, Spotlight, Settings, Hide.
+- **Double-click** for Spotlight. **Right-click** for everything else, including Quit.
+- **Tray icon:** click to show or hide; the menu has every quick action.
+
+### Global shortcuts
+
+| Keys | Action |
+|---|---|
+| `Super+Alt+C` | Show / hide camera |
+| `Super+Alt+Z` | Spotlight (big & centered) |
+| `Super+Alt+B` | Next background effect |
+| `Super+Alt+M` | Mirror |
+| `Super+Alt+X` | Click-through on / off |
+| `Super+Alt+O` | Settings |
+| `Super+Alt+1…4` / `5` | Snap to a corner / center |
+
+On X11 these work immediately. On GNOME Wayland, install them once from Settings → Shortcuts
+or with `selficamera --install-shortcuts`.
+
+### Command line and automation
+
+Every action works from a terminal, so you can drive SelfiCamera from a Stream Deck, OBS
+scripts or your own hotkeys. Commands reach the running instance in a fraction of a second.
+
+```bash
+selficamera --scene "Intro"                   # apply a saved scene
+selficamera --spotlight                       # toggle spotlight
+selficamera --set background_mode=blur --set blur_strength=70
+selficamera --set shape=portrait --set size=320
+selficamera --snap 4                          # 1 TL, 2 TR, 3 BL, 4 BR, 5 center
+selficamera --status                          # current state as JSON
+selficamera --exit
+```
+
+Startup options: `--device /dev/video2`, `--width 1920 --height 1080`, `--fps 60`, `--shape`,
+`--background`, `--size`, `--no-mirror`, `--ghost`, `--demo` (synthetic camera, no hardware),
+`--config PATH`, `--debug`. See `selficamera --help`.
+
+## Recording tips
+
+- **OBS:** add a *Screen Capture (PipeWire)* source. The camera shows up because it's part of the screen.
+- **Clean look:** Settings → General → turn off *Show controls on hover*. You can still right-click.
+- **Cut-out presenter:** Background → *Remove*, Border → *Off*, Drop shadow off.
+- **Chroma key in your editor:** Background → *Color* → green (`#00B140`).
+- **Intro to tutorial:** save a big centered scene "Intro" and a small corner scene "Tutorial",
+  then switch with `selficamera --scene Tutorial` or press `Super+Alt+Z` for Spotlight.
+
+## Files
+
+| What | Where |
+|---|---|
+| Settings | `~/.config/selficamera/config.json` (0.1 configs migrate automatically) |
+| Log | `~/.local/state/selficamera/selficamera.log` |
+| AI models | `~/.local/share/selficamera/models/` (`selfie_segmenter.tflite`, `face_detection_yunet_2023mar.onnx`) |
+
+Custom ONNX models with a `[1,256,256,3] → [1,256,256,1]` signature also work: drop
+`selfie_segmenter.onnx` in the models folder or point `SELFICAMERA_MODEL` at the file.
+
+## Develop
+
+```bash
+bash run.sh --demo                                     # run from source with a synthetic camera
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest                             # 100+ tests, headless, no camera needed
+.venv/bin/python benchmarks/benchmark_pipeline.py      # per-frame latency (budget: p95 ≤ 20 ms)
+.venv/bin/python benchmarks/network_privacy_audit.py   # proves no network access at runtime
+```
+
+Architecture: `capture/camera.py` captures **and processes** frames on a worker thread and hands
+the GUI only the newest frame. `processor/` does framing, light & color, segmentation and
+background compositing at the bubble's on-screen size. `app.py` is the single place where
+settings are validated, applied and saved (debounced). `ui/` holds the bubble, hover controls,
+settings window and tray. `desktop.py` has the GNOME shortcuts, autostart and model install.
+Product spec: [docs/PRODUCT.md](docs/PRODUCT.md).
 
 ## License
 
-MIT License. Built for offline presentation perfection on Ubuntu Linux.
+MIT. The optional AI models, Google's MediaPipe Selfie Segmenter (Apache-2.0) and OpenCV's YuNet face detector (MIT), are downloaded on request.

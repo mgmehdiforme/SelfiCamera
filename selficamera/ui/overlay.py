@@ -1,501 +1,650 @@
-"""Frameless circular presentation overlay window with anti-aliasing, soft shadow, drag, scroll-resize, and ghost mode."""
+"""The camera bubble: a frameless, shaped, always-on-top window.
+
+Geometry is anchored on the content *center* so resizing, shape changes and
+spotlight animations never drift. Positions are persisted as center coordinates.
+"""
 
 from __future__ import annotations
 
 import logging
-import math
+import time
 from typing import Optional, Tuple
+
+import cv2
+import numpy as np
 from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
     QPoint,
     QPointF,
-    QPropertyAnimation,
     QRect,
     QRectF,
-    QSize,
     Qt,
-    Property,
+    QTimer,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
     QColor,
     QContextMenuEvent,
+    QFont,
     QGuiApplication,
     QImage,
+    QLinearGradient,
     QMouseEvent,
     QPainter,
     QPainterPath,
-    QPixmap,
-    QRegion,
+    QPen,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QMenu, QWidget
+from PySide6.QtWidgets import QWidget
 
-from selficamera.ui.aura import VoiceAuraRing
-from selficamera.ui.hud import AutoHidingHUD
+from selficamera.config import MAX_SIZE, MIN_SIZE
+from selficamera.ui import icons
+from selficamera.ui.hud import HoverControls
+from selficamera.ui.shapes import content_size, edge_distance_px, normalized_distance, shape_path
+from selficamera.ui.voice_wave import VoiceWave
 
 logger = logging.getLogger(__name__)
 
-MIN_DIAMETER = 120
-MAX_DIAMETER = 600
-PRESET_DIAMETERS = [160, 260, 380]
-DEFAULT_SHADOW_MARGIN = 16
-CORNER_MARGIN = 24
+MARGIN = 30  # room for shadow, border and the voice wave around the content
+SNAP_MARGIN = 24
+EDGE_ZONE = 10.0
+WHEEL_STEP = 20
+
+# Snap targets
+TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT, CENTER = 1, 2, 3, 4, 5
+POSITION_LABELS = {
+    TOP_LEFT: "Top left",
+    TOP_RIGHT: "Top right",
+    BOTTOM_LEFT: "Bottom left",
+    BOTTOM_RIGHT: "Bottom right",
+    CENTER: "Center",
+}
 
 
-class OverlayWindow(QWidget):
-    """Floating borderless circular camera bubble for desktop presenters."""
+class BubbleWindow(QWidget):
+    """Floating camera bubble."""
 
-    diameter_changed = Signal(int)
-    diameter_completed = Signal(int)
-    position_changed = Signal(int, int)
-    drag_completed = Signal(int, int)
-    ghost_mode_changed = Signal(bool)
-    always_on_top_changed = Signal(bool)
+    position_committed = Signal(int, int)  # content center
+    size_changed = Signal(int)
+    size_committed = Signal(int)
+    render_size_changed = Signal(int, int)  # device pixels for the processor
     settings_requested = Signal()
-    light_toggle_requested = Signal()
+    context_menu_requested = Signal(QPoint)
+    spotlight_changed = Signal(bool)
 
     def __init__(
         self,
-        initial_diameter: int = 260,
-        initial_pos: Optional[Tuple[int, int]] = None,
-        shadow_margin: int = DEFAULT_SHADOW_MARGIN,
+        shape: str = "circle",
+        size: int = 260,
+        center: Optional[Tuple[int, int]] = None,
         always_on_top: bool = True,
     ) -> None:
         super().__init__()
-        self._diameter = max(MIN_DIAMETER, min(MAX_DIAMETER, int(initial_diameter)))
-        self.shadow_margin = shadow_margin
+        self._shape = shape
+        self._size = int(max(MIN_SIZE, min(MAX_SIZE, size)))
+        self._center = QPointF(0, 0)
         self._always_on_top = always_on_top
-        self._voice_energy: float = 0.0
-        self._is_ghost_mode: bool = False
-        self._current_frame: Optional[QImage] = None
+        self._ghost = False
+        self._border_width = 3
+        self._border_color = QColor("#FFFFFF")
+        self._voice_glow = True
+        self._shadow = True
+        self._energy = 0.0
+        self._frame: Optional[QImage] = None
+        self._status_state = "starting"
+        self._status_text = "Starting camera…"
+        self._toast_text = ""
+        self._toast_until = 0.0
+        self._render_size: Tuple[int, int] = (0, 0)
+        self._shadow_cache_key: Optional[tuple] = None
+        self._shadow_cache: Optional[QImage] = None
+        self._setting_geometry = False
 
-        # Dragging and resizing states
-        self._is_dragging = False
-        self._drag_start_pos = QPoint()
-        self._is_dragging_resize = False
-        self._is_resizing = False
+        self._drag_offset: Optional[QPointF] = None
+        self._resize_start: Optional[Tuple[float, int]] = None
+        self._press_global: Optional[QPointF] = None
 
-        # Voice aura renderer
-        self.aura_renderer = VoiceAuraRing(shadow_margin=self.shadow_margin)
+        self._spotlight_saved: Optional[Tuple[QPointF, int]] = None
 
-        # Setup frameless transparent window flags
-        self._setup_window_flags()
+        self._apply_window_flags()
+        self.setMouseTracking(True)
+        self.setWindowTitle("SelfiCamera")
 
-        # HUD setup
-        self.hud = AutoHidingHUD(self)
+        self.hud = HoverControls(self)
         self.hud.settings_clicked.connect(self.settings_requested)
-        self.hud.size_down_clicked.connect(lambda: self.step_resize_delta(-25))
-        self.hud.size_up_clicked.connect(lambda: self.step_resize_delta(25))
-        self.hud.light_clicked.connect(self.light_toggle_requested)
+        self.hud.spotlight_clicked.connect(self.toggle_spotlight)
 
-        # Resize animation
-        self._resize_anim = QPropertyAnimation(self, b"diameter", self)
-        self._resize_anim.setDuration(180)
-        self._resize_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._resize_anim.finished.connect(lambda: self.diameter_completed.emit(self._diameter))
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.valueChanged.connect(self._on_anim_step)
+        self._anim.finished.connect(self._on_anim_finished)
+        self._anim_from: Tuple[QPointF, int] = (QPointF(), self._size)
+        self._anim_to: Tuple[QPointF, int] = (QPointF(), self._size)
+        self._anim_commit_size = False
 
-        # Move/Snap animation
-        self._move_anim = QPropertyAnimation(self, b"pos", self)
-        self._move_anim.setDuration(200)
-        self._move_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._move_anim.finished.connect(lambda: self.drag_completed.emit(self.pos().x(), self.pos().y()))
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self.update)
 
-        # Initialize window geometry
-        total_dim = self._diameter + (2 * self.shadow_margin)
-        self.resize(total_dim, total_dim)
+        self.wave = VoiceWave()
+        self._wave_timer = QTimer(self)
+        self._wave_timer.setInterval(16)
+        self._wave_timer.timeout.connect(self._on_wave_tick)
+        self._wave_last = time.monotonic()
 
-        if initial_pos is not None:
-            self.move(initial_pos[0], initial_pos[1])
+        self._apply_geometry()
+        if center is not None and self._point_on_any_screen(QPointF(*center)):
+            self._center = QPointF(*center)
+            self._apply_geometry()
         else:
-            self.snap_to_corner(4)  # Default: Bottom-Right
+            self.snap_to(BOTTOM_RIGHT, animate=False)
 
-        # Canonical Float Center-Point Anchor (Frozen during resizing to guarantee 0.0px drift)
-        self._center_point = QPointF(self.x() + self.width() / 2.0, self.y() + self.height() / 2.0)
-        self._reposition_hud()
-
-    def _setup_window_flags(self) -> None:
-        """Apply essential flags for floating presenter overlay."""
-        flags = (
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-        )
+    # ---------------------------------------------------------------- flags
+    def _apply_window_flags(self) -> None:
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.NoDropShadowWindowHint
         if self._always_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
+        if self._ghost:
+            flags |= Qt.WindowType.WindowTransparentForInput
+        was_visible = self.isVisible()
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setMouseTracking(True)
-
-    def moveEvent(self, event) -> None:
-        """Update canonical center point when window moves outside resizing operations."""
-        super().moveEvent(event)
-        if not self._is_resizing:
-            self._center_point = QPointF(self.x() + self.width() / 2.0, self.y() + self.height() / 2.0)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        if was_visible:
+            self.show()
+            self._apply_geometry()
 
     def set_always_on_top(self, enabled: bool) -> None:
-        """Dynamically toggle WindowStaysOnTopHint while preserving window visibility."""
-        self._always_on_top = enabled
-        flags = self.windowFlags()
-        if enabled:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
-        else:
-            flags &= ~Qt.WindowType.WindowStaysOnTopHint
-        self.setWindowFlags(flags)
-        self.show()  # Crucial: Qt hides window upon flag modification!
-        self.always_on_top_changed.emit(enabled)
-        logger.info("Always-on-top %s", "ENABLED" if enabled else "DISABLED")
+        if enabled != self._always_on_top:
+            self._always_on_top = enabled
+            self._apply_window_flags()
 
     @property
     def is_always_on_top(self) -> bool:
         return self._always_on_top
 
-    # Qt Property for smooth diameter resizing
-    def get_diameter(self) -> int:
-        return self._diameter
-
-    def set_diameter(self, val: int | float) -> None:
-        val = int(round(max(MIN_DIAMETER, min(MAX_DIAMETER, val))))
-        if self._diameter == val:
-            return
-        self._is_resizing = True
-        try:
-            self._diameter = val
-            total_dim = self._diameter + (2 * self.shadow_margin)
-            new_x = int(round(self._center_point.x() - total_dim / 2.0))
-            new_y = int(round(self._center_point.y() - total_dim / 2.0))
-            self.setGeometry(new_x, new_y, total_dim, total_dim)
-            self._reposition_hud()
-            self.update()
-            self.diameter_changed.emit(self._diameter)
-        finally:
-            self._is_resizing = False
-
-    diameter = Property(int, get_diameter, set_diameter)
-
-    def animate_to_diameter(self, target_diameter: int) -> None:
-        """Smoothly animate overlay diameter to target value with zero center drift."""
-        target_diameter = max(MIN_DIAMETER, min(MAX_DIAMETER, int(target_diameter)))
-        if target_diameter != self._diameter:
-            self._resize_anim.stop()
-            self._resize_anim.setStartValue(self._diameter)
-            self._resize_anim.setEndValue(target_diameter)
-            self._resize_anim.start()
-
-    def step_resize_delta(self, delta: int) -> None:
-        """Step diameter by delta (e.g. +25 or -25px) with center anchoring."""
-        new_d = max(MIN_DIAMETER, min(MAX_DIAMETER, self._diameter + delta))
-        self.animate_to_diameter(new_d)
-
-    def _reposition_hud(self) -> None:
-        """Position HUD capsule near bottom arc of circle with small-diameter adaptation."""
-        if self._diameter < 190:
-            self.hud.set_compact_mode(True)
-            hud_w = min(self._diameter - 10, 160)
-            hud_h = 26
-            y = self.shadow_margin + self._diameter - hud_h - 10
-        else:
-            self.hud.set_compact_mode(False)
-            hud_w = min(264, self.width() - (2 * self.shadow_margin) + 8)
-            hud_h = 32
-            y = self.shadow_margin + self._diameter - hud_h - 14
-
-        x = max(0, (self.width() - hud_w) // 2)
-        self.hud.setGeometry(x, y, hud_w, hud_h)
-
-    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
-        """Pop up dark styled presenter context menu with settings and quick toggles."""
-        if self._is_ghost_mode:
-            return
-
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #1E1E2E;
-                color: #CDD6F4;
-                border: 1px solid rgba(255, 255, 255, 30);
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 6px 20px 6px 10px;
-                border-radius: 4px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                font-size: 11px;
-            }
-            QMenu::item:selected {
-                background-color: #313244;
-                color: #89B4FA;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: rgba(255, 255, 255, 20);
-                margin: 4px 6px;
-            }
-        """)
-
-        action_settings = menu.addAction("⚙ Settings...")
-        action_settings.triggered.connect(self.settings_requested)
-
-        menu.addSeparator()
-
-        action_aot = menu.addAction("Always-On-Top")
-        action_aot.setCheckable(True)
-        action_aot.setChecked(self._always_on_top)
-        action_aot.triggered.connect(lambda checked: self.set_always_on_top(checked))
-
-        action_ghost = menu.addAction("Click-Through Ghost Mode")
-        action_ghost.triggered.connect(lambda: self.set_click_through(True))
-
-        menu.addSeparator()
-
-        preset_menu = menu.addMenu("Size Presets")
-        preset_menu.setStyleSheet(menu.styleSheet())
-        for size in PRESET_DIAMETERS:
-            act = preset_menu.addAction(f"{size} px")
-            act.triggered.connect(lambda checked, s=size: self.set_diameter(s))
-
-        menu.exec(event.globalPos())
-        event.accept()
-
     def set_click_through(self, enabled: bool) -> None:
-        """Toggle click-through Ghost Mode passing mouse clicks directly to underlying windows."""
-        self._is_ghost_mode = enabled
+        if enabled == self._ghost:
+            return
+        self._ghost = enabled
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, enabled)
-
-        flags = self.windowFlags()
         if enabled:
-            flags |= Qt.WindowType.WindowTransparentForInput
-            self.hud.trigger_hide()
-        else:
-            flags &= ~Qt.WindowType.WindowTransparentForInput
-
-        self.setWindowFlags(flags)
-        self.clearMask()
-        self.show()
-
+            self.hud.hide_now()
+        self._apply_window_flags()
         self.update()
-        self.ghost_mode_changed.emit(enabled)
-        logger.info("Ghost mode %s", "ENABLED" if enabled else "DISABLED")
-
-    def toggle_click_through(self) -> bool:
-        """Toggle ghost mode state."""
-        self.set_click_through(not self._is_ghost_mode)
-        return self._is_ghost_mode
 
     @property
-    def is_ghost_mode(self) -> bool:
-        return self._is_ghost_mode
+    def is_click_through(self) -> bool:
+        return self._ghost
 
-    def update_frame_image(self, image: QImage) -> None:
-        """Update active video frame and schedule repaint."""
-        self._current_frame = image
+    # -------------------------------------------------------------- geometry
+    @staticmethod
+    def _point_on_any_screen(p: QPointF) -> bool:
+        return QGuiApplication.screenAt(p.toPoint()) is not None
+
+    def _screen_geometry(self) -> QRect:
+        screen = QGuiApplication.screenAt(self._center.toPoint()) or self.screen() or QGuiApplication.primaryScreen()
+        return screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+
+    @property
+    def shape(self) -> str:
+        return self._shape
+
+    @property
+    def size_value(self) -> int:
+        return self._size
+
+    def get_diameter(self) -> int:  # backwards compatible name
+        return self._size
+
+    @property
+    def center(self) -> QPointF:
+        return QPointF(self._center)
+
+    def content_rect(self) -> QRectF:
+        cw, ch = content_size(self._shape, self._size)
+        return QRectF(MARGIN, MARGIN, cw, ch)
+
+    def _apply_geometry(self) -> None:
+        cw, ch = content_size(self._shape, self._size)
+        tw, th = cw + 2 * MARGIN, ch + 2 * MARGIN
+        x = int(round(self._center.x() - tw / 2.0))
+        y = int(round(self._center.y() - th / 2.0))
+        self._setting_geometry = True
+        try:
+            self.setGeometry(x, y, tw, th)
+        finally:
+            self._setting_geometry = False
+        self._layout_hud()
+        dpr = self.devicePixelRatioF() if self.windowHandle() else 1.0
+        render = (max(16, int(cw * dpr)), max(16, int(ch * dpr)))
+        if render != self._render_size:
+            self._render_size = render
+            self.render_size_changed.emit(*render)
         self.update()
 
-    def update_voice_energy(self, energy: float) -> None:
-        """Update active vocal energy and schedule repaint."""
-        self._voice_energy = energy
-        self.update()
+    @property
+    def render_size(self) -> Tuple[int, int]:
+        return self._render_size
 
-    def step_resize(self, step_up: bool) -> None:
-        """Step diameter to next larger or smaller preset with smooth cubic easing animation."""
-        if self._diameter in PRESET_DIAMETERS:
-            idx = PRESET_DIAMETERS.index(self._diameter)
-            new_idx = max(0, min(len(PRESET_DIAMETERS) - 1, idx + (1 if step_up else -1)))
-            target_diameter = PRESET_DIAMETERS[new_idx]
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        if not self._setting_geometry and self._anim.state() != QVariantAnimation.State.Running:
+            self._center = QPointF(self.x() + self.width() / 2.0, self.y() + self.height() / 2.0)
+
+    def _layout_hud(self) -> None:
+        cw, ch = content_size(self._shape, self._size)
+        self.hud.set_compact(cw < 210)
+        hint = self.hud.preferred_size()
+        w, h = min(hint.width(), cw - 12), hint.height()
+        x = MARGIN + (cw - w) / 2.0
+        bottom_pad = 14 if self._shape != "circle" else max(14, int(ch * 0.07))
+        y = MARGIN + ch - h - bottom_pad
+        self.hud.setGeometry(int(x), int(y), int(w), int(h))
+
+    def set_shape(self, shape: str) -> None:
+        if shape != self._shape:
+            self._shape = shape
+            self._shadow_cache_key = None
+            self._apply_geometry()
+
+    def set_size(self, size: int, animate: bool = False) -> None:
+        size = int(max(MIN_SIZE, min(MAX_SIZE, size)))
+        if animate:
+            self._animate_to(self._center, size, commit_size=True)
+            return
+        if size != self._size:
+            self._size = size
+            self._apply_geometry()
+            self.size_changed.emit(size)
+
+    set_diameter = set_size
+
+    def step_size(self, delta: int) -> None:
+        self.set_size(self._size + delta, animate=True)
+
+    def move_center_to(self, cx: float, cy: float, animate: bool = False) -> None:
+        if animate:
+            self._animate_to(QPointF(cx, cy), self._size)
         else:
-            if step_up:
-                candidates = [p for p in PRESET_DIAMETERS if p > self._diameter]
-                target_diameter = candidates[0] if candidates else PRESET_DIAMETERS[-1]
-            else:
-                candidates = [p for p in PRESET_DIAMETERS if p < self._diameter]
-                target_diameter = candidates[-1] if candidates else PRESET_DIAMETERS[0]
+            self._center = QPointF(cx, cy)
+            self._apply_geometry()
 
-        if target_diameter != self._diameter:
-            self._resize_anim.stop()
-            self._resize_anim.setStartValue(self._diameter)
-            self._resize_anim.setEndValue(target_diameter)
-            self._resize_anim.start()
+    def snap_target(self, position: int, size: Optional[int] = None) -> QPointF:
+        avail = self._screen_geometry()
+        cw, ch = content_size(self._shape, size if size is not None else self._size)
+        hw, hh = cw / 2.0, ch / 2.0
+        left = avail.left() + SNAP_MARGIN + hw
+        right = avail.left() + avail.width() - SNAP_MARGIN - hw
+        top = avail.top() + SNAP_MARGIN + hh
+        bottom = avail.top() + avail.height() - SNAP_MARGIN - hh
+        mid = QPointF(avail.left() + avail.width() / 2.0, avail.top() + avail.height() / 2.0)
+        return {
+            TOP_LEFT: QPointF(left, top),
+            TOP_RIGHT: QPointF(right, top),
+            BOTTOM_LEFT: QPointF(left, bottom),
+            BOTTOM_RIGHT: QPointF(right, bottom),
+            CENTER: mid,
+        }.get(position, QPointF(right, bottom))
 
-    def snap_to_corner(self, corner_id: int) -> None:
-        """Snap window to one of four desktop corners or center (1: TL, 2: TR, 3: BL, 4: BR, 5: Center)."""
-        screen = (
-            self.screen()
-            or QGuiApplication.screenAt(self._center_point.toPoint())
-            or QGuiApplication.primaryScreen()
-        )
-        avail_geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+    def snap_to(self, position: int, animate: bool = True) -> None:
+        target = self.snap_target(position)
+        self._spotlight_saved = None
+        if animate and self.isVisible():
+            self._animate_to(target, self._size)
+        else:
+            self._center = target
+            self._apply_geometry()
+            self.position_committed.emit(int(target.x()), int(target.y()))
 
-        win_w = self.width()
-        win_h = self.height()
+    snap_to_corner = snap_to
 
-        margin = CORNER_MARGIN
-        # Corner math respecting top bar and docks
-        if corner_id == 1:  # Top-Left
-            target_x = avail_geo.left() + margin
-            target_y = avail_geo.top() + margin
-        elif corner_id == 2:  # Top-Right
-            target_x = avail_geo.right() - win_w - margin + 1
-            target_y = avail_geo.top() + margin
-        elif corner_id == 3:  # Bottom-Left
-            target_x = avail_geo.left() + margin
-            target_y = avail_geo.bottom() - win_h - margin + 1
-        elif corner_id == 5:  # Center
-            target_x = avail_geo.left() + (avail_geo.width() - win_w) // 2
-            target_y = avail_geo.top() + (avail_geo.height() - win_h) // 2
-        else:  # 4: Bottom-Right (Default)
-            target_x = avail_geo.right() - win_w - margin + 1
-            target_y = avail_geo.bottom() - win_h - margin + 1
+    def clamp_on_screen(self) -> None:
+        """Keep at least the content fully inside the current screen."""
+        avail = self._screen_geometry()
+        cw, ch = content_size(self._shape, self._size)
+        cx = min(max(self._center.x(), avail.left() + cw / 2.0), avail.left() + avail.width() - cw / 2.0)
+        cy = min(max(self._center.y(), avail.top() + ch / 2.0), avail.top() + avail.height() - ch / 2.0)
+        if (cx, cy) != (self._center.x(), self._center.y()):
+            self._center = QPointF(cx, cy)
+            self._apply_geometry()
 
-        self._move_anim.stop()
-        self._move_anim.setStartValue(self.pos())
-        self._move_anim.setEndValue(QPoint(target_x, target_y))
-        self._move_anim.start()
-        self.position_changed.emit(target_x, target_y)
+    # ------------------------------------------------------------- animation
+    def _animate_to(self, center: QPointF, size: int, commit_size: bool = False, duration: int = 260) -> None:
+        self._anim.stop()
+        self._anim_from = (QPointF(self._center), self._size)
+        self._anim_to = (QPointF(center), int(size))
+        self._anim_commit_size = commit_size or size != self._size
+        if not self.isVisible():
+            self._on_anim_step(1.0)
+            self._on_anim_finished()
+            return
+        self._anim.setDuration(duration)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.start()
+
+    def _on_anim_step(self, t) -> None:
+        t = float(t)
+        (c0, s0), (c1, s1) = self._anim_from, self._anim_to
+        self._center = QPointF(c0.x() + (c1.x() - c0.x()) * t, c0.y() + (c1.y() - c0.y()) * t)
+        new_size = int(round(s0 + (s1 - s0) * t))
+        size_changed = new_size != self._size
+        self._size = new_size
+        self._apply_geometry()
+        if size_changed:
+            self.size_changed.emit(new_size)
+
+    def _on_anim_finished(self) -> None:
+        self.position_committed.emit(int(self._center.x()), int(self._center.y()))
+        if self._anim_commit_size:
+            self.size_committed.emit(self._size)
+
+    @property
+    def is_animating(self) -> bool:
+        return self._anim.state() == QVariantAnimation.State.Running
+
+    # -------------------------------------------------------------- spotlight
+    @property
+    def in_spotlight(self) -> bool:
+        return self._spotlight_saved is not None
+
+    def spotlight_size(self, scale: float = 0.62) -> int:
+        avail = self._screen_geometry()
+        short = min(avail.width(), avail.height()) * scale
+        cw, ch = content_size(self._shape, int(short))
+        f = min(1.0, avail.width() * 0.92 / cw, avail.height() * 0.92 / ch)
+        return int(max(MIN_SIZE, min(MAX_SIZE, short * f)))
+
+    def toggle_spotlight(self, scale: float = 0.62) -> None:
+        if self._spotlight_saved is None:
+            self._spotlight_saved = (QPointF(self._center), self._size)
+            avail = self._screen_geometry()
+            target = QPointF(avail.left() + avail.width() / 2.0, avail.top() + avail.height() / 2.0)
+            self._animate_to(target, self.spotlight_size(scale), duration=420)
+            self.spotlight_changed.emit(True)
+        else:
+            center, size = self._spotlight_saved
+            self._spotlight_saved = None
+            self._animate_to(center, size, duration=380)
+            self.spotlight_changed.emit(False)
+
+    def _leave_spotlight_silently(self) -> None:
+        if self._spotlight_saved is not None:
+            self._spotlight_saved = None
+            self.spotlight_changed.emit(False)
+
+    # --------------------------------------------------------------- styling
+    def set_border(self, width: int, color: str) -> None:
+        self._border_width = int(width)
+        self._border_color = QColor(color)
+        self.update()
+
+    def set_voice_glow(self, enabled: bool) -> None:
+        self._voice_glow = enabled
+        if not enabled:
+            self.wave.set_energy(0.0)
+            self.wave.level = 0.0
+            self.wave.ripples.clear()
+            self._wave_timer.stop()
+        self.update()
+
+    def set_shadow(self, enabled: bool) -> None:
+        self._shadow = enabled
+        self.update()
+
+    def set_controls_on_hover(self, enabled: bool) -> None:
+        self.hud.set_controls_enabled(enabled)
+
+    # --------------------------------------------------------------- content
+    def set_frame(self, image: Optional[QImage]) -> None:
+        if image is not None and not image.isNull():
+            self._frame = image
+            self.update()
+
+    update_frame_image = set_frame
+
+    def set_status(self, state: str, message: str) -> None:
+        self._status_state = state
+        self._status_text = message
+        self.update()
+
+    def set_voice_energy(self, energy: float) -> None:
+        energy = max(0.0, min(1.0, float(energy)))
+        self._energy = energy
+        if not self._voice_glow:
+            return
+        self.wave.set_energy(energy)
+        if self.wave.active and not self._wave_timer.isActive() and self.isVisible():
+            self._wave_last = time.monotonic()
+            self._wave_timer.start()
+
+    def _on_wave_tick(self) -> None:
+        now = time.monotonic()
+        alive = self.wave.tick(now - self._wave_last)
+        self._wave_last = now
+        if not alive:
+            self._wave_timer.stop()
+        self.update()
+
+    update_voice_energy = set_voice_energy
+
+    def show_toast(self, text: str, ms: int = 3200) -> None:
+        self._toast_text = text
+        self._toast_until = time.monotonic() + ms / 1000.0
+        self._toast_timer.start(ms + 20)
+        self.update()
+
+    @property
+    def toast_text(self) -> str:
+        return self._toast_text if time.monotonic() < self._toast_until else ""
+
+    # ------------------------------------------------------------------ input
+    def _zone(self, pos: QPointF) -> str:
+        rect = self.content_rect()
+        d = edge_distance_px(self._shape, rect, pos)
+        if -EDGE_ZONE <= d <= EDGE_ZONE:
+            return "edge"
+        if d < -EDGE_ZONE:
+            return "inside"
+        return "outside"
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        """Initiate drag-to-move or radial resize if clicked inside circle or on border aura."""
-        if event.button() == Qt.MouseButton.LeftButton and not self._is_ghost_mode:
-            cx = self.width() / 2.0
-            cy = self.height() / 2.0
-            dist = math.hypot(event.position().x() - cx, event.position().y() - cy)
-            r = self._diameter / 2.0
-
-            # 1. Radial perimeter resize zone [r - 14, r + 16]
-            if (r - 14.0) <= dist <= (r + 16.0):
-                self._is_dragging_resize = True
-                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        if self._ghost:
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            zone = self._zone(pos)
+            self._anim.stop()
+            if zone == "edge":
+                nd = normalized_distance(self._shape, self.content_rect(), pos)
+                self._resize_start = (max(0.2, nd), self._size)
                 event.accept()
                 return
-
-            # 2. Window drag zone (inside circle + glowing aura border)
-            if dist <= (r + 4.0):
-                self._is_dragging = True
-                self._drag_start_pos = event.globalPosition().toPoint() - self.pos()
+            if zone == "inside" and QGuiApplication.platformName().startswith("wayland") and self.windowHandle():
+                # Native Wayland: only the compositor may move windows.
+                self.windowHandle().startSystemMove()
+                event.accept()
+                return
+            if zone == "inside":
+                self._drag_offset = event.globalPosition() - self._center
+                self._press_global = event.globalPosition()
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 event.accept()
                 return
-
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """Execute smooth drag-to-move across all displays or radial resizing."""
-        cx = self.width() / 2.0
-        cy = self.height() / 2.0
-        dist = math.hypot(event.position().x() - cx, event.position().y() - cy)
-        r = self._diameter / 2.0
-
-        # Hover cursor feedback when not dragging
-        if not self._is_ghost_mode and not self._is_dragging and not self._is_dragging_resize:
-            if (r - 14.0) <= dist <= (r + 16.0):
-                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-            elif dist <= (r - 14.0):
-                self.setCursor(Qt.CursorShape.OpenHandCursor)
-            else:
-                self.unsetCursor()
-
-        # Continuous radial resize drag
-        if self._is_dragging_resize and (event.buttons() & Qt.MouseButton.LeftButton):
-            new_diameter = int(round(2.0 * dist))
-            self.set_diameter(new_diameter)
+        if self._ghost:
+            return
+        pos = event.position()
+        if self._resize_start is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            nd0, s0 = self._resize_start
+            nd = normalized_distance(self._shape, self.content_rect(), pos) * self._size / s0
+            # nd is measured against the current rect; convert to scale of the original
+            self._leave_spotlight_silently()
+            self.set_size(int(round(s0 * nd / nd0)))
             event.accept()
             return
-
-        # Continuous window reposition drag across multi-monitor setup
-        if self._is_dragging and (event.buttons() & Qt.MouseButton.LeftButton):
-            target_pos = event.globalPosition().toPoint() - self._drag_start_pos
-
-            screens = QGuiApplication.screens()
-            if screens:
-                virtual_rect = screens[0].geometry()
-                for s in screens[1:]:
-                    virtual_rect = virtual_rect.united(s.geometry())
-                clamped_x = max(virtual_rect.left(), min(virtual_rect.right() - self.width() + 1, target_pos.x()))
-                clamped_y = max(virtual_rect.top(), min(virtual_rect.bottom() - self.height() + 1, target_pos.y()))
-                target_pos = QPoint(clamped_x, clamped_y)
-
-            self.move(target_pos)
-            self.position_changed.emit(target_pos.x(), target_pos.y())
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._leave_spotlight_silently()
+            self._center = event.globalPosition() - self._drag_offset
+            self._apply_geometry()
             event.accept()
             return
-
+        zone = self._zone(pos)
+        if zone == "edge":
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif zone == "inside":
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.unsetCursor()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        """Conclude dragging and emit completion signals for deferred disk persistence."""
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._is_dragging_resize:
-                self._is_dragging_resize = False
-                self.diameter_completed.emit(self._diameter)
-            if self._is_dragging:
-                self._is_dragging = False
-                self.drag_completed.emit(self.pos().x(), self.pos().y())
-            self.unsetCursor()
+            if self._resize_start is not None:
+                self._resize_start = None
+                self.size_committed.emit(self._size)
+            if self._drag_offset is not None:
+                self._drag_offset = None
+                self.clamp_on_screen()
+                self.position_committed.emit(int(self._center.x()), int(self._center.y()))
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if not self._ghost and event.button() == Qt.MouseButton.LeftButton and self._zone(event.position()) == "inside":
+            self.toggle_spotlight()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Smooth continuous scroll-wheel resizing."""
-        if not self._is_ghost_mode:
-            delta = event.angleDelta().y()
-            if delta != 0:
-                step = int(round(delta / 120.0 * 15.0))
-                if step == 0:
-                    step = 15 if delta > 0 else -15
-                new_d = max(MIN_DIAMETER, min(MAX_DIAMETER, self._diameter + step))
-                self.set_diameter(new_d)
-                self.diameter_completed.emit(self._diameter)
-                event.accept()
-                return
+        if self._ghost:
+            return
+        delta = event.angleDelta().y()
+        if delta:
+            step = int(round(delta / 120.0 * WHEEL_STEP)) or (WHEEL_STEP if delta > 0 else -WHEEL_STEP)
+            self._leave_spotlight_silently()
+            self.set_size(self._size + step)
+            self.size_committed.emit(self._size)
+            event.accept()
+            return
         super().wheelEvent(event)
 
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        if not self._ghost:
+            self.context_menu_requested.emit(event.globalPos())
+            event.accept()
+
     def enterEvent(self, event: QEvent) -> None:
-        """Fade in HUD on mouse hover."""
         super().enterEvent(event)
-        if not self._is_ghost_mode:
-            self.hud.trigger_show()
+        if not self._ghost:
+            self.hud.reveal()
 
     def leaveEvent(self, event: QEvent) -> None:
-        """Fade out HUD after leaving."""
         super().leaveEvent(event)
-        self.hud.trigger_hide_delayed()
+        self.hud.schedule_hide()
+
+    # ---------------------------------------------------------------- render
+    def _shadow_image(self) -> QImage:
+        cw, ch = content_size(self._shape, self._size)
+        key = (self._shape, cw, ch)
+        if key == self._shadow_cache_key and self._shadow_cache is not None:
+            return self._shadow_cache
+        w, h = cw + 2 * MARGIN, ch + 2 * MARGIN
+        alpha = np.zeros((h, w), dtype=np.uint8)
+        img = QImage(alpha.data, w, h, w, QImage.Format.Format_Grayscale8)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255))
+        p.drawPath(shape_path(self._shape, QRectF(MARGIN, MARGIN + 5, cw, ch)))
+        p.end()
+        blurred = cv2.GaussianBlur(alpha, (0, 0), sigmaX=9)
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[..., 3] = (blurred.astype(np.float32) * 0.55).astype(np.uint8)
+        shadow = QImage(rgba.data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
+        self._shadow_cache_key, self._shadow_cache = key, shadow
+        return shadow
 
     def paintEvent(self, event) -> None:
-        """High-precision rendering: soft drop shadow, circular clipped video, dynamic aura, stroke."""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        rect = self.content_rect()
+        path = shape_path(self._shape, rect)
 
-        cx = self.width() / 2.0
-        cy = self.height() / 2.0
-        center = QPointF(cx, cy)
-        radius = self._diameter / 2.0
+        transparent_bg = self._frame is not None and self._frame.hasAlphaChannel()
+        if self._shadow and not transparent_bg:
+            p.drawImage(0, 0, self._shadow_image())
 
-        # 1. Outer soft Gaussian drop shadow
-        self.aura_renderer.draw_drop_shadow(painter, center, radius)
+        p.save()
+        p.setClipPath(path)
+        live = self._frame is not None and self._status_state != "error"
+        if self._frame is not None:
+            p.drawImage(rect, self._frame)
+        if not live:
+            grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            alpha = 200 if self._frame is not None else 255
+            grad.setColorAt(0, QColor(34, 37, 46, alpha))
+            grad.setColorAt(1, QColor(18, 19, 24, alpha))
+            p.fillRect(rect, grad)
+            self._paint_status(p, rect)
+        p.restore()
 
-        # 2. Aspect-ratio locked video feed clipped to exact 1:1 circle
-        clip_path = QPainterPath()
-        clip_path.addEllipse(center, radius, radius)
+        if self._voice_glow:
+            base = self._border_width / 2.0 + 0.5
+            self.wave.paint(p, self._shape, rect, self._border_color, base, MARGIN - base - 5, QRectF(self.rect()))
+        self._paint_border(p, path)
 
-        painter.save()
-        painter.setClipPath(clip_path)
+        toast = self.toast_text
+        if toast:
+            self._paint_toast(p, rect, toast)
+        p.end()
 
-        if self._current_frame is not None and not self._current_frame.isNull():
-            # Render video frame scaled to circle
-            target_rect = QRectF(self.shadow_margin, self.shadow_margin, self._diameter, self._diameter)
-            painter.drawImage(target_rect, self._current_frame)
-        else:
-            # Standby placeholder
-            painter.fillRect(self.rect(), QColor(24, 24, 37))
-            painter.setPen(QColor(140, 140, 160))
-            font = painter.font()
-            font.setPointSize(12)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "SelfiCamera\nConnecting...")
+    def _paint_status(self, p: QPainter, rect: QRectF) -> None:
+        name = "camera"
+        color = "#9AA0AE" if self._status_state != "error" else "#F5B83D"
+        icon_px = max(18, min(40, int(rect.height() * 0.16)))
+        img = icons.icon_image(name, icon_px, color, 1.8, 2.0)
+        cy = rect.center().y() - icon_px * 0.9
+        p.drawImage(QRectF(rect.center().x() - icon_px / 2, cy - icon_px / 2, icon_px, icon_px), img)
+        font = QFont(self.font())
+        font.setPixelSize(max(10, min(15, int(rect.width() / 17))))
+        font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(font)
+        p.setPen(QColor("#ECEDF1"))
+        text_rect = QRectF(rect.left() + rect.width() * 0.12, cy + icon_px * 0.6, rect.width() * 0.76, rect.height() * 0.4)
+        p.drawText(text_rect, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), self._status_text or "Starting camera…")
 
-        painter.restore()
+    def _paint_border(self, p: QPainter, path: QPainterPath) -> None:
+        bw = self._border_width
+        color = QColor(self._border_color)
+        if bw > 0:
+            pen = QPen(color, bw)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
 
-        # 3. Dynamic Voice Aura border ring & inner stroke
-        self.aura_renderer.draw_aura(painter, center, radius, self._voice_energy, self._is_ghost_mode)
+    def _paint_toast(self, p: QPainter, rect: QRectF, text: str) -> None:
+        font = QFont(self.font())
+        font.setPixelSize(12)
+        font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(font)
+        max_w = rect.width() * 0.86
+        metrics = p.fontMetrics()
+        br = metrics.boundingRect(QRect(0, 0, int(max_w) - 20, 400), int(Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignCenter), text)
+        w, h = br.width() + 22, br.height() + 12
+        top = rect.top() + (rect.height() * 0.12 if self._shape == "circle" else 12)
+        box = QRectF(rect.center().x() - w / 2, top, w, h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(18, 19, 24, 225))
+        p.drawRoundedRect(box, h / 2 if h < 30 else 10, h / 2 if h < 30 else 10)
+        p.setPen(QColor("#ECEDF1"))
+        p.drawText(box, int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap), text)

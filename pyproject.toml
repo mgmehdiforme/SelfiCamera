@@ -4,31 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "selficamera"
-version = "0.1.0"
-description = "Lightweight, zero-bloat, offline circular presenter camera overlay for Ubuntu Linux"
+version = "1.0.0"
+description = "Offline webcam overlay for screen recording and streaming on Linux: shapes, background effects, scenes, spotlight"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [
-    {name = "SelfiCamera Team"}
+authors = [{name = "Mehdi Golzari"}]
+keywords = ["webcam", "overlay", "youtube", "screen recording", "obs", "facecam", "linux", "wayland"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video :: Capture",
 ]
 dependencies = [
-    "PySide6-Essentials>=6.6.0",
-    "opencv-python-headless>=4.8.0,<5.0",
-    "onnxruntime>=1.16.0",
-    "numpy>=1.24.0",
+    "PySide6-Essentials>=6.6,<7",
+    "opencv-python-headless>=4.8,<5",
+    "numpy>=1.24",
+    "onnxruntime>=1.16",
     "sounddevice>=0.4.6",
     "python-xlib>=0.33",
-    "psutil>=5.9.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/mgmehdiforme/SelfiCamera"
+Issues = "https://github.com/mgmehdiforme/SelfiCamera/issues"
+
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-qt>=4.2.0",
-    "pytest-mock>=3.12.0",
-    "onnx>=1.14.0",
-]
+ai = ["ai-edge-litert>=1.0"]
+dev = ["pytest>=7.4", "pytest-qt>=4.2", "pytest-mock>=3.12", "psutil>=5.9", "onnx>=1.14"]
 
 [project.scripts]
 selficamera = "selficamera.__main__:main"
@@ -36,3 +43,14 @@ selficamera = "selficamera.__main__:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["selficamera*"]
+
+[tool.setuptools.package-data]
+selficamera = ["models/*.onnx", "models/*.tflite"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"

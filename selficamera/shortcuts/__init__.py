@@ -1,5 +1,6 @@
-"""Shortcuts and IPC subsystem supporting X11 global hotkeys and Wayland socket IPC."""
-from selficamera.shortcuts.manager import ShortcutManager
-from selficamera.shortcuts.ipc import ShortcutIPCServer, ShortcutIPCClient
+"""Global shortcuts, IPC and desktop integration."""
 
-__all__ = ["ShortcutManager", "ShortcutIPCServer", "ShortcutIPCClient"]
+from selficamera.shortcuts.manager import HOTKEYS, ShortcutManager
+from selficamera.shortcuts.ipc import ShortcutIPCClient, ShortcutIPCServer
+
+__all__ = ["HOTKEYS", "ShortcutManager", "ShortcutIPCServer", "ShortcutIPCClient"]

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+selficamera/models/*.tflite
+selficamera/models/*.onnx
+.ruff_cache/
+*.part
+*.part.onnx
+# Internal planning notes from development; not part of the app.
+.agents/

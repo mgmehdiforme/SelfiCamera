@@ -88,4 +88,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Skip interpreter finalization: on Python 3.10, garbage-collecting the Qt objects created
+    # by the runtime check can abort *after* the audit has finished ("deallocating None").
+    os._exit(code)

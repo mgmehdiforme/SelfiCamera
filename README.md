@@ -34,10 +34,11 @@ Then open **SelfiCamera** from your apps, or run `selficamera`. The installer:
 - downloads the two offline AI models once (~480 KB, see below),
 - adds SelfiCamera to your app menu and the `selficamera` command to `~/.local/bin`.
 
-It also tells you if two system libraries are missing. On Ubuntu/Debian:
+At the end it prints the exact `sudo apt install …` line if your system is missing libraries
+(you can check again any time with `selficamera --check-system`). On a fresh Ubuntu that is:
 
 ```bash
-sudo apt install libxcb-cursor0 libportaudio2
+sudo apt install libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-keysyms1 libxcb-xkb1 libportaudio2
 ```
 
 **Update:** run the same command again. **Uninstall:** `bash ~/.local/share/selficamera/app/uninstall.sh`
@@ -64,8 +65,8 @@ bash install.sh --with-model --with-shortcuts
 `install.sh` points the launcher at this checkout. You can also run it without installing: `bash run.sh`.
 </details>
 
-> **Why `libxcb-cursor0`?** GNOME on Wayland only lets apps stay on top and position themselves
-> when they run through XWayland, and Qt needs this library for that. Without it SelfiCamera still
+> **Why these libraries?** GNOME on Wayland only lets apps stay on top and position themselves
+> when they run through XWayland, and Qt's X11 mode needs them. Without it SelfiCamera still
 > runs, but in *limited mode*: it can't stay on top or snap to corners, and it tells you so.
 
 ## Use it

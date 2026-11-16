@@ -97,18 +97,84 @@ def setup_logging(debug: bool = False) -> Path:
 
 
 # ------------------------------------------------------------------ platform
-XCB_HINT = "sudo apt install libxcb-cursor0"
+# Libraries Qt's X11 (xcb) plugin needs beyond a standard desktop. Ubuntu doesn't install
+# all of them by default. Used when ``ldd`` is unavailable.
+XCB_LIBS = (
+    "libxcb-cursor.so.0",
+    "libxkbcommon-x11.so.0",
+    "libxcb-icccm.so.4",
+    "libxcb-keysyms.so.1",
+    "libxcb-xkb.so.1",
+    "libxcb-image.so.0",
+    "libxcb-render-util.so.0",
+    "libxcb-randr.so.0",
+    "libxcb-shape.so.0",
+    "libxcb-xinerama.so.0",
+    "libxcb-xinput.so.0",
+)
+AUDIO_LIBS = ("libportaudio.so.2",)
 
 
-def xcb_runtime_available() -> bool:
-    """Qt >= 6.5 needs libxcb-cursor to run on X11/XWayland."""
+def deb_package(soname: str) -> str:
+    """Debian/Ubuntu package for a library soname: libxcb-icccm.so.4 -> libxcb-icccm4."""
+    name, _, version = soname.partition(".so.")
+    version = version.split(".")[0]
+    if not version:
+        return name
+    return f"{name}-{version}" if name[-1:].isdigit() else f"{name}{version}"
+
+
+def _qt_xcb_plugin_files() -> List[Path]:
+    try:
+        import PySide6  # noqa: F401 - only to locate the Qt directory
+    except ImportError:
+        return []
+    qt = Path(PySide6.__file__).resolve().parent / "Qt"
+    return [f for f in (qt / "plugins" / "platforms" / "libqxcb.so", qt / "lib" / "libQt6XcbQpa.so.6") if f.exists()]
+
+
+def _loadable(soname: str) -> bool:
     import ctypes
 
     try:
-        ctypes.CDLL("libxcb-cursor.so.0")
+        ctypes.CDLL(soname)
         return True
     except OSError:
         return False
+
+
+def missing_xcb_libs(runner: Optional[Runner] = None) -> List[str]:
+    """Sonames Qt's X11 plugin needs but this system lacks (empty = X11 mode will start)."""
+    files = _qt_xcb_plugin_files()
+    ldd = shutil.which("ldd")
+    if files and ldd:
+        run = runner or subprocess.run
+        missing = set()
+        try:
+            for f in files:
+                res = run([ldd, str(f)], capture_output=True, text=True, timeout=10)
+                for line in res.stdout.splitlines():
+                    if "not found" in line:
+                        missing.add(line.split("=>")[0].strip())
+            return sorted(missing)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return [lib for lib in XCB_LIBS if not _loadable(lib)]
+
+
+def missing_system_packages() -> List[str]:
+    """apt packages to install for the full experience (X11 mode + voice wave)."""
+    libs = missing_xcb_libs() + [lib for lib in AUDIO_LIBS if not _loadable(lib)]
+    return sorted({deb_package(lib) for lib in libs})
+
+
+def apt_hint(packages: Sequence[str]) -> str:
+    return "sudo apt install " + " ".join(packages) if packages else ""
+
+
+def xcb_runtime_available() -> bool:
+    """True when every library Qt's X11 plugin needs is installed."""
+    return not missing_xcb_libs()
 
 
 def choose_qt_platform(env: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], bool]:
@@ -124,9 +190,10 @@ def choose_qt_platform(env: Optional[Dict[str, str]] = None) -> Tuple[Optional[s
         return None, env["QT_QPA_PLATFORM"].startswith("wayland")
     wayland = bool(env.get("WAYLAND_DISPLAY")) or env.get("XDG_SESSION_TYPE", "").lower() == "wayland"
     if not wayland:
-        return "xcb", False
+        return "xcb", False  # pure X11 session: there is nothing to fall back to
     if env.get("DISPLAY") and xcb_runtime_available():
-        return "xcb", False
+        # Fallback list: if the X11 plugin still fails to start, Qt uses Wayland instead of aborting.
+        return "xcb;wayland", False
     return "wayland", True
 
 

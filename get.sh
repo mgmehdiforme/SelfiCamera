@@ -39,15 +39,4 @@ if ! command -v uv >/dev/null 2>&1; then
     command -v uv >/dev/null 2>&1 || die "Could not install uv. See https://docs.astral.sh/uv/ and run this installer again."
 fi
 
-missing=()
-ldconfig -p 2>/dev/null | grep -q "libportaudio.so.2" || missing+=(libportaudio2)
-ldconfig -p 2>/dev/null | grep -q "libxcb-cursor.so.0" || missing+=(libxcb-cursor0)
-
 bash "$DEST/install.sh" --with-model "$@"
-
-if [ "${#missing[@]}" -gt 0 ]; then
-    echo
-    say "One more step (needs your password once):"
-    echo "    sudo apt install ${missing[*]}"
-    echo "  libxcb-cursor0 lets the camera stay on top on GNOME; libportaudio2 powers the voice wave."
-fi

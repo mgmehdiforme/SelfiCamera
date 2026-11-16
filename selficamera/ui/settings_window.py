@@ -673,9 +673,13 @@ class SettingsWindow(QWidget):
         page, layout = self._page("General", "Window behavior and startup.")
         if getattr(self.c, "limited_wayland", False):
             warn, wl0 = card("Limited mode", page)
+            from selficamera.desktop import apt_hint, deb_package, missing_xcb_libs
+
+            hint = apt_hint(sorted({deb_package(lib) for lib in missing_xcb_libs()}))
             msg = QLabel(
                 "SelfiCamera is running as a native Wayland window, so GNOME won't keep it on top or let it "
-                "snap to corners. Install the missing library and restart:\n\n    sudo apt install libxcb-cursor0",
+                "snap to corners. "
+                + (f"Install the missing libraries and restart:\n\n    {hint}" if hint else "Restart SelfiCamera to switch modes."),
                 warn,
             )
             msg.setWordWrap(True)

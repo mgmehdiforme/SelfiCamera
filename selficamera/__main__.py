@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup = p.add_argument_group("setup")
     setup.add_argument("--install-shortcuts", action="store_true", help="Register global shortcuts in GNOME")
     setup.add_argument("--remove-shortcuts", action="store_true", help="Remove GNOME shortcuts")
+    setup.add_argument("--check-system", action="store_true", help="List missing system packages (apt) and exit")
     setup.add_argument("--install-model", action="store_true", help="Download the offline AI models: background and face (one time, ~500 KB)")
     return p
 
@@ -111,6 +112,13 @@ def run_setup(args: argparse.Namespace) -> Optional[int]:
         ok, msg = desktop.GnomeShortcuts().remove()
         print(msg)
         return 0 if ok else 1
+    if args.check_system:
+        pkgs = desktop.missing_system_packages()
+        if pkgs:
+            print(desktop.apt_hint(pkgs))
+            return 1
+        print("All system libraries are installed.")
+        return 0
     if args.install_model:
         print("Downloading the MediaPipe Selfie Segmenter model (Apache-2.0, ~250 KB)…")
         ok, msg = desktop.install_model()
@@ -173,17 +181,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("SelfiCamera is already running.")
         return 0
 
-    from selficamera.desktop import XCB_HINT, choose_qt_platform, setup_logging
+    from selficamera.desktop import apt_hint, choose_qt_platform, missing_xcb_libs, setup_logging
 
     log_file = setup_logging(args.debug)
     platform, limited = choose_qt_platform()
     if platform:
         os.environ["QT_QPA_PLATFORM"] = platform
     if limited:
+        from selficamera.desktop import deb_package
+
+        hint = apt_hint(sorted({deb_package(lib) for lib in missing_xcb_libs()}))
         logger.warning(
             "Running as a native Wayland window: GNOME will not let the camera stay on top or "
-            "snap to corners. Fix: %s, then restart SelfiCamera.",
-            XCB_HINT,
+            "snap to corners.%s",
+            f" Fix: {hint}, then restart SelfiCamera." if hint else "",
         )
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
 
@@ -206,6 +217,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     controller = SelfiCameraApp(config_path=args.config, mock_mode=args.demo, cli_overrides=cli_overrides(args))
     controller.limited_wayland = qt_app.platformName().startswith("wayland")
+    if controller.limited_wayland and not limited:
+        logger.warning("X11 mode could not start, so SelfiCamera fell back to a native Wayland window (limited mode).")
     if "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
         # Shadow/rounded-corner extensions would draw a box around the transparent bubble.
         from selficamera.desktop import ShadowExtensions

@@ -200,7 +200,7 @@ def test_choose_qt_platform(monkeypatch):
     assert desktop.choose_qt_platform({"QT_QPA_PLATFORM": "offscreen"}) == (None, False)
     assert desktop.choose_qt_platform({"SELFICAMERA_PLATFORM": "wayland"}) == ("wayland", True)
     monkeypatch.setattr(desktop, "xcb_runtime_available", lambda: True)
-    assert desktop.choose_qt_platform({"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}) == ("xcb", False)
+    assert desktop.choose_qt_platform({"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}) == ("xcb;wayland", False)
     monkeypatch.setattr(desktop, "xcb_runtime_available", lambda: False)
     assert desktop.choose_qt_platform({"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}) == ("wayland", True)
 
@@ -256,3 +256,33 @@ def test_install_face_model_rejects_bad_download(tmp_path):
     ok, msg = install_face_model(tmp_path, opener=lambda url, timeout: _Resp(b"x" * 60_000))
     assert not ok and "not a valid" in msg
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "soname,pkg",
+    [
+        ("libxcb-cursor.so.0", "libxcb-cursor0"),
+        ("libxkbcommon-x11.so.0", "libxkbcommon-x11-0"),
+        ("libxcb-icccm.so.4", "libxcb-icccm4"),
+        ("libportaudio.so.2", "libportaudio2"),
+    ],
+)
+def test_deb_package_names(soname, pkg):
+    from selficamera.desktop import deb_package
+
+    assert deb_package(soname) == pkg
+
+
+def test_missing_xcb_libs_reads_ldd(monkeypatch, tmp_path):
+    from selficamera import desktop
+
+    plugin = tmp_path / "libqxcb.so"
+    plugin.write_bytes(b"")
+    monkeypatch.setattr(desktop, "_qt_xcb_plugin_files", lambda: [plugin])
+    monkeypatch.setattr(desktop.shutil, "which", lambda name: "/usr/bin/ldd")
+    out = "\tlibxcb.so.1 => /usr/lib/libxcb.so.1 (0x1)\n\tlibxkbcommon-x11.so.0 => not found\n\tlibxcb-icccm.so.4 => not found\n"
+    runner = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")  # noqa: E731
+    assert desktop.missing_xcb_libs(runner) == ["libxcb-icccm.so.4", "libxkbcommon-x11.so.0"]
+    monkeypatch.setattr(desktop, "missing_xcb_libs", lambda runner=None: ["libxkbcommon-x11.so.0"])
+    monkeypatch.setattr(desktop, "_loadable", lambda lib: True)
+    assert desktop.apt_hint(desktop.missing_system_packages()) == "sudo apt install libxkbcommon-x11-0"

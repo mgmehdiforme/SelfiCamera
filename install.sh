@@ -20,14 +20,11 @@ for arg in "$@"; do
 done
 
 echo "Installing SelfiCamera…"
-if ! ldconfig -p 2>/dev/null | grep -q "libxcb-cursor.so.0"; then
-    echo "  ! Missing system library libxcb-cursor0. Without it the camera cannot stay on top on GNOME."
-    echo "    Install it with:  sudo apt install libxcb-cursor0"
-fi
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_ROOT/scalable/apps" "$ICON_ROOT/256x256/apps"
 
 echo "  • Preparing Python environment (first time can take a minute)"
 bash "$SCRIPT_DIR/run.sh" --version >/dev/null
+SYSTEM_HINT="$(bash "$SCRIPT_DIR/run.sh" --check-system 2>/dev/null)" && SYSTEM_HINT=""
 
 echo "  • Launcher: $BIN_DIR/selficamera"
 cat > "$BIN_DIR/selficamera" <<LAUNCHER
@@ -62,4 +59,11 @@ echo
 echo "Done. Open “SelfiCamera” from your apps, or run: selficamera"
 [ "$WITH_MODEL" = 1 ] || echo "Tip: enable accurate AI background effects with: selficamera --install-model"
 [ "$WITH_SHORTCUTS" = 1 ] || echo "Tip: add global shortcuts on GNOME with:       selficamera --install-shortcuts"
+if [ -n "$SYSTEM_HINT" ]; then
+    echo
+    echo "One more step (needs your password once):"
+    echo "    $SYSTEM_HINT"
+    echo "These system libraries let the camera stay on top on GNOME and power the voice wave."
+    echo "SelfiCamera works without them, in limited mode."
+fi
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) echo "Note: add $BIN_DIR to your PATH to run 'selficamera' from a terminal." ;; esac

@@ -75,6 +75,10 @@ def _fmt_signed(v: int) -> str:
     return f"{v:+d}" if v else "0"
 
 
+def _fmt_amount(v: int) -> str:
+    return "Off" if v == 0 else f"{v}"
+
+
 class SettingsWindow(QWidget):
     """Top-level settings window bound to a SelfiCameraApp controller."""
 
@@ -485,6 +489,13 @@ class SettingsWindow(QWidget):
     }
 
     def refresh_model_info(self) -> None:
+        face_ai = self.c.auto_light_source() == "face"
+        self.lbl_enhance_hint.setText(
+            "Denoise removes webcam grain without smearing motion. Soft skin smooths skin only inside your face "
+            "(eyes, brows and hair stay sharp). Sharpen brings back detail; use it after denoise."
+            + ("" if face_ai else "  Soft skin needs the face model: selficamera --install-model")
+        )
+        self.sl_soft_skin.setEnabled(face_ai)
         if self.lbl_autolight_hint is not None:
             self.lbl_autolight_hint.setText(self.AUTO_LIGHT_HINTS.get(self.c.auto_light_source(), ""))
         neural, name = self.c.model_info()
@@ -527,10 +538,27 @@ class SettingsWindow(QWidget):
             sl.valueChanged.connect(lambda v, k=key: self._set(k, v))
             self._bind(key, sl.set_value_silently)
             ll.addWidget(sl)
-        btn = QPushButton("Reset light & color", lc)
+        btn = QPushButton("Reset light && color", lc)
         btn.clicked.connect(lambda: self.c.reset_light())
         ll.addWidget(btn, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(lc)
+
+        ec, el = card("Enhance", page)
+        self.sl_denoise = SliderRow("Denoise", 0, 100, 0, 30, _fmt_amount, ec)
+        self.sl_soft_skin = SliderRow("Soft skin", 0, 100, 0, 0, _fmt_amount, ec)
+        self.sl_sharpen = SliderRow("Sharpen", 0, 100, 0, 0, _fmt_amount, ec)
+        for key, sl in (("denoise", self.sl_denoise), ("soft_skin", self.sl_soft_skin), ("sharpen", self.sl_sharpen)):
+            sl.valueChanged.connect(lambda v, k=key: self._set(k, v))
+            self._bind(key, sl.set_value_silently)
+            el.addWidget(sl)
+        self.lbl_enhance_hint = QLabel("", ec)
+        self.lbl_enhance_hint.setObjectName("Hint")
+        self.lbl_enhance_hint.setWordWrap(True)
+        el.addWidget(self.lbl_enhance_hint)
+        btn_e = QPushButton("Reset enhance", ec)
+        btn_e.clicked.connect(lambda: self.c.reset_enhance())
+        el.addWidget(btn_e, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(ec)
         layout.addStretch(1)
         return page
 

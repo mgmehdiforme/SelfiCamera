@@ -24,7 +24,7 @@ import numpy as np
 # Comfortable exposure band for the subject (8-bit luma). Outside it, auto light
 # moves the subject to the nearest target; inside it, nothing changes.
 SUBJECT_DARK, SUBJECT_DARK_TARGET = 98.0, 124.0
-SUBJECT_BRIGHT, SUBJECT_BRIGHT_TARGET = 205.0, 178.0
+SUBJECT_BRIGHT, SUBJECT_BRIGHT_TARGET = 172.0, 152.0
 MAX_GAMMA = 1.35
 
 # What auto light meters on: ("face", [(x, y, w, h, score), ...]) or ("person", mask HxW float)

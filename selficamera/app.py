@@ -394,6 +394,10 @@ class SelfiCameraApp(QObject):
         for key in ("auto_light", "brightness", "contrast", "saturation", "warmth"):
             self.set(key, DEFAULT_CONFIG[key])
 
+    def reset_enhance(self) -> None:
+        for key in ("denoise", "soft_skin", "sharpen"):
+            self.set(key, DEFAULT_CONFIG[key])
+
     def reset_all(self) -> None:
         self.config.reset_to_defaults(auto_save=False)
         cfg = self.config.as_dict()

@@ -8,6 +8,7 @@ it all with OBS, GNOME's screen recorder, SimpleScreenRecorder or Kazam.
 - **Background:** blur, solid color (including chroma green for editing), your own image, or **remove** so only you float over the screen
 - **Framing:** zoom, pan and **auto-frame**, which follows you and keeps your head in the upper third
 - **Light & color:** AI auto light that meters on your face (fixes backlit or washed-out faces, leaves a well-lit face alone), plus brightness, contrast, saturation and warmth
+- **Enhance:** denoise that removes webcam grain without smearing motion, soft skin that smooths skin only inside your face (eyes, brows and hair stay sharp), and sharpen
 - **Spotlight:** one key grows the camera to the center for intros and outros; the same key sends it back
 - **Scenes:** save looks such as "Intro" or "Tutorial corner" and switch with a click, the tray or a hotkey
 - **Clean recordings:** controls only on hover (or never), no auto-opening windows, Quit is never on the camera
@@ -115,6 +116,8 @@ Startup options: `--device /dev/video2`, `--width 1920 --height 1080`, `--fps 60
 - **OBS:** add a *Screen Capture (PipeWire)* source. The camera shows up because it's part of the screen.
 - **Clean look:** Settings → General → turn off *Show controls on hover*. You can still right-click.
 - **Cut-out presenter:** Background → *Remove*, Border → *Off*, Drop shadow off.
+- **Cheap or grainy webcam:** Settings → Light & Color → Enhance: Denoise 50–70, then Sharpen 20–40.
+  Add Soft skin 30–60 for a rested look (`selficamera --set soft_skin=50`). Each option is saved in scenes.
 - **Chroma key in your editor:** Background → *Color* → green (`#00B140`).
 - **Intro to tutorial:** save a big centered scene "Intro" and a small corner scene "Tutorial",
   then switch with `selficamera --scene Tutorial` or press `Super+Alt+Z` for Spotlight.

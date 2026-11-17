@@ -135,3 +135,12 @@ def test_parse_cli_value_types():
     assert parse_cli_value("zoom", "1.5") == 1.5
     with pytest.raises(ValueError):
         parse_cli_value("shape", "star")
+
+
+def test_enhance_settings_validate():
+    from selficamera.config import DEFAULT_CONFIG, SCENE_KEYS, parse_cli_value, validate_value
+
+    assert DEFAULT_CONFIG["denoise"] == 30 and DEFAULT_CONFIG["soft_skin"] == 0
+    assert parse_cli_value("soft_skin", "55") == 55
+    assert validate_value("sharpen", 250) == 100 and validate_value("denoise", -5) == 0
+    assert {"denoise", "soft_skin", "sharpen"} <= set(SCENE_KEYS)

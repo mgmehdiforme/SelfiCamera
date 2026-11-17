@@ -42,7 +42,7 @@ def discover_face_model() -> Optional[Path]:
 class FaceDetector:
     """Finds faces in BGR frames. ``available`` is False when no model is installed."""
 
-    def __init__(self, model_path: Optional[str | Path] = None, score_threshold: float = 0.7) -> None:
+    def __init__(self, model_path: Optional[str | Path] = None, score_threshold: float = 0.6) -> None:
         self.model_path: Optional[Path] = None
         self._det = None
         self._input: Tuple[int, int] = (0, 0)

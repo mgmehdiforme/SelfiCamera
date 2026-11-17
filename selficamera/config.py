@@ -74,6 +74,9 @@ SCENE_KEYS: Tuple[str, ...] = (
     "pan_y",
     "auto_frame",
     "mirror",
+    "denoise",
+    "soft_skin",
+    "sharpen",
 )
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -106,6 +109,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "contrast": 0,
     "saturation": 0,
     "warmth": 0,
+    # Enhance (face-aware touch-ups; a light denoise is on by default)
+    "denoise": 30,
+    "soft_skin": 0,
+    "sharpen": 0,
     # Background
     "background_mode": "none",
     "blur_strength": 60,
@@ -242,6 +249,9 @@ VALIDATORS: Dict[str, Callable[[Any], Any]] = {
     "contrast": _clamp_num(-50, 50, _int_round),
     "saturation": _clamp_num(-100, 100, _int_round),
     "warmth": _clamp_num(-50, 50, _int_round),
+    "denoise": _clamp_num(0, 100, _int_round),
+    "soft_skin": _clamp_num(0, 100, _int_round),
+    "sharpen": _clamp_num(0, 100, _int_round),
     "background_mode": _choice(BACKGROUND_MODES),
     "blur_strength": _clamp_num(0, 100, _int_round),
     "background_color": _color,

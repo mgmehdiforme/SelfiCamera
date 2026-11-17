@@ -359,3 +359,17 @@ def test_bubble_wave_timer_starts_and_stops(qapp):
     b.set_voice_glow(False)
     assert not b._wave_timer.isActive() and not b.wave.active
     b.close()
+
+
+def test_enhance_controls_bind_both_ways(app_controller, qtbot):
+    c = app_controller
+    c.open_settings()
+    w = c.settings_window
+    w.sl_soft_skin.setEnabled(True)
+    w.sl_denoise.slider.setValue(70)
+    assert c.get("denoise") == 70 and c.processor.denoise == 70
+    c.set("sharpen", 35)
+    assert w.sl_sharpen.slider.value() == 35 and c.processor.sharpen == 35
+    c.set("soft_skin", 40)
+    c.reset_enhance()
+    assert (c.get("denoise"), c.get("soft_skin"), c.get("sharpen")) == (30, 0, 0)

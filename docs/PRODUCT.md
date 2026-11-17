@@ -72,8 +72,28 @@ Masks are temporally smoothed to avoid flicker.
 and says so in Settings → Background ("Basic mode — install the AI model for accurate edges").
 
 ### 3.4 Light & color
-Auto light meters on the **face** (OpenCV YuNet, MIT, ~230 KB, every 4th frame, ~2 ms), falling back to the person mask, then the frame center. A face outside the comfortable band (luma 98–205) is moved to the nearest target; a well-lit face is left alone, so skin tones are not normalised. Manual controls: Brightness, Contrast, Saturation, Warmth (−50…+50 each,
+Auto light meters on the **face** (OpenCV YuNet, MIT, ~230 KB, every 4th frame, ~2 ms), falling back to the person mask, then the frame center. A face outside the comfortable band (luma 98–172) is moved to the nearest target; a well-lit face is left alone, so skin tones are not normalised. Manual controls: Brightness, Contrast, Saturation, Warmth (−50…+50 each,
 double-click a slider to reset). Applied as one per-channel lookup table plus an optional saturation blend.
+
+### 3.4.1 Enhance
+All three run at the bubble's on-screen size and add at most ~5 ms per frame at 380 px.
+
+| Option | Default | How |
+|---|---|---|
+| Denoise (0–100) | 30 | Motion-adaptive temporal filter: still pixels are averaged over frames, moving pixels pass through, so there is no ghosting. |
+| Soft skin (0–100) | Off | Edge-preserving (bilateral) smoothing restricted to skin inside the detected face (YuNet box × skin-tone mask × feathered ellipse), with fine texture added back. Needs the face model. |
+| Sharpen (0–100) | Off | Small-radius unsharp mask, applied after denoise and soft skin so it doesn't amplify grain. |
+
+Order per frame: denoise → auto light & manual color → soft skin → sharpen → background.
+
+**Researched and deliberately not included (Nov 2026):**
+
+| Candidate | Why not |
+|---|---|
+| Face restoration: GFPGAN, CodeFormer, GPEN, RestoreFormer | 280–470 MB ONNX models, seconds per frame on a CPU, frame-to-frame flicker and identity drift. CodeFormer (S-Lab) and GPEN are non-commercial. Built for restoring old photos, not live video. |
+| Low-light: Zero-DCE / Zero-DCE++, SCI | CC BY-NC (non-commercial): a monetised channel is commercial use. |
+| IAT exposure/color (Apache-2.0, 90K params) | Converted to ONNX and made ~10× faster for CPU, then tested on real webcam frames. Its brightness decisions depend on input size (it darkened an already-dark frame at 224 px) and crushed shadows; once bounded to be safe, the visible gain was a few levels of color at ~17 % of a CPU core. The useful part of its result (taming a washed-out face) is now done by face-metered auto light at no cost. |
+| Super-resolution (FSRCNN, Real-ESRGAN) | The camera already delivers more pixels than the bubble shows in normal use; only extreme zoom on a 480p camera would benefit. |
 
 ### 3.5 Scenes
 Save the current look and position (shape, size, position, background, border, framing) under a name.
@@ -111,5 +131,5 @@ bubble), logs at `~/.local/state/selficamera/selficamera.log`, config at
 | Tests | Full suite passes headless (`QT_QPA_PLATFORM=offscreen`), no camera or mic required. |
 
 ## 5. Out of scope for 1.0
-Virtual camera output (v4l2loopback) for Zoom/Meet, built-in recording, beauty filters, multi-camera
+Virtual camera output (v4l2loopback) for Zoom/Meet, built-in recording, generative face restoration, multi-camera
 layouts, macOS/Windows builds. Virtual camera output is the recommended next feature.

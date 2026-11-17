@@ -10,13 +10,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from selficamera.processor.background import BackgroundCompositor
-from selficamera.processor.face import FaceDetector
+from selficamera.processor.enhance import TemporalDenoiser, sharpen, soft_skin
+from selficamera.processor.face import Box, FaceDetector
 from selficamera.processor.framing import AutoFramer, CropRect, compute_crop
 from selficamera.processor.lighting import ImageAdjuster, Meter
 from selficamera.processor.segmentation import SegmentationEngine
@@ -25,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_SIDE = 1280
 AUTOFRAME_EVERY_N = 4
-METER_EVERY_N = 4  # face detection for auto light runs on every 4th frame (~7.5 Hz)
-FACE_HOLD_FRAMES = 8  # keep metering on the last face for ~1 s if it is briefly lost
+METER_EVERY_N = 4  # face detection (auto light, soft skin) runs on every 4th frame (~7.5 Hz)
+FACE_HOLD_FRAMES = 8  # keep using the last face for ~1 s if it is briefly lost
 
 PROCESSOR_KEYS = (
     "mirror",
@@ -43,6 +44,9 @@ PROCESSOR_KEYS = (
     "blur_strength",
     "background_color",
     "background_image",
+    "denoise",
+    "soft_skin",
+    "sharpen",
 )
 
 
@@ -67,13 +71,19 @@ class FrameProcessor:
         self.blur_strength = 60
         self.background_color = "#00B140"
         self.background_image = ""
+        self.denoise = 0
+        self.soft_skin = 0
+        self.sharpen = 0
 
         self.adjuster = ImageAdjuster()
         self.segmentation = segmentation or SegmentationEngine(model_path=model_path)
         self.compositor = BackgroundCompositor()
         self.framer = AutoFramer()
         self.face = face_detector if face_detector is not None else FaceDetector()
+        self.denoiser = TemporalDenoiser()
         self._meter: Optional[Meter] = None
+        self._faces: List[Box] = []
+        self._faces_checked = False
         self._face_misses = 0
         self._last_mask: Optional[np.ndarray] = None
         self._output_size = self._sanitize_size(output_size)
@@ -104,7 +114,10 @@ class FrameProcessor:
                 self._output_size = new
                 self.segmentation.reset()
                 self._meter = None
+                self._faces = []
+                self._faces_checked = False
                 self._last_mask = None
+                self.denoiser.reset()
 
     def configure(self, **settings: Any) -> None:
         with self._lock:
@@ -172,28 +185,48 @@ class FrameProcessor:
             return "face"
         return "person" if self.segmentation.is_neural else "center"
 
-    def _update_meter(self, out: np.ndarray) -> None:
-        """Decide what auto light meters on (runs before light & color are applied)."""
+    @property
+    def needs_faces(self) -> bool:
+        return self.face.available and (self.adjuster.auto_light or self.soft_skin > 0)
+
+    def _update_faces(self, out: np.ndarray) -> None:
+        """Track faces for auto light and soft skin (throttled; holds briefly when lost)."""
+        if not self.needs_faces:
+            self._faces, self._faces_checked = [], False
+            return
         # Offset by one so face detection never lands on a frame where the background
         # model runs (it infers on even frames) and the two costs never stack.
-        if self._frame_index % METER_EVERY_N != 1 and self._meter is not None:
+        if self._frame_index % METER_EVERY_N != 1 and self._faces_checked:
             return
-        if self.face.available:
-            boxes = self.face.detect(out)
-            if boxes:
-                self._meter = ("face", boxes)
-                self._face_misses = 0
-                return
+        self._faces_checked = True
+        boxes = self.face.detect(out)
+        if boxes:
+            self._faces, self._face_misses = boxes, 0
+        else:
             self._face_misses += 1
-            if self._meter is not None and self._meter[0] == "face" and self._face_misses <= FACE_HOLD_FRAMES:
-                return
+            if self._face_misses > FACE_HOLD_FRAMES:
+                self._faces = []
+
+    def _update_meter(self, out: np.ndarray) -> None:
+        """Decide what auto light meters on (runs before light & color are applied)."""
+        if self._faces:
+            self._meter = ("face", self._faces)
+            return
+        if self.face.available and self._meter is not None and self._meter[0] == "face" and self._face_misses <= FACE_HOLD_FRAMES:
+            return
         if self.segmentation.is_neural:
             if self.needs_mask and self._last_mask is not None:
                 self._meter = ("person", self._last_mask)
-            elif self._frame_index % (2 * METER_EVERY_N) == 0 or self._meter is None:
+            elif self._frame_index % (2 * METER_EVERY_N) == 0 or self._meter is None or self._meter[0] != "person":
                 self._meter = ("person", self.segmentation.infer_raw(out))
             return
         self._meter = None
+
+    @property
+    def enhance_status(self) -> Dict[str, Any]:
+        return {
+            "faces": len(self._faces),
+        }
 
     def process(self, frame: np.ndarray) -> np.ndarray:
         """Return BGR (opaque) or BGRA (background removed) at output size."""
@@ -219,9 +252,15 @@ class FrameProcessor:
                 out = cv2.flip(out, 1)
             t1 = time.perf_counter()
 
+            # Enhance, in an order that keeps each step honest: denoise first (so nothing
+            # amplifies grain), then light & color, then face touch-up, sharpening last.
+            out = self.denoiser.process(out, self.denoise)
+            self._update_faces(out)
             if self.adjuster.auto_light:
                 self._update_meter(out)
             out = self.adjuster.process(out, self._meter if self.adjuster.auto_light else None)
+            out = soft_skin(out, self._faces, self.soft_skin)
+            out = sharpen(out, self.sharpen)
             t2 = time.perf_counter()
 
             if self.needs_mask:
@@ -231,7 +270,7 @@ class FrameProcessor:
             t3 = time.perf_counter()
             self.last_timings = {
                 "crop_ms": (t1 - t0) * 1000,
-                "adjust_ms": (t2 - t1) * 1000,
+                "adjust_ms": (t2 - t1) * 1000,  # enhance + light & color
                 "background_ms": (t3 - t2) * 1000,
                 "total_ms": (t3 - t0) * 1000,
             }

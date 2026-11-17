@@ -341,3 +341,70 @@ def test_face_detector_without_model(monkeypatch):
     monkeypatch.delenv("SELFICAMERA_FACE_MODEL", raising=False)
     det = FaceDetector()
     assert not det.available and det.detect(np.zeros((50, 50, 3), np.uint8)) == []
+
+
+# ------------------------------------------------------------------ enhance
+def test_denoise_reduces_grain_on_still_scene():
+    from selficamera.processor.enhance import TemporalDenoiser
+
+    rng = np.random.default_rng(0)
+    clean = np.full((120, 120, 3), 128, np.uint8)
+    dn = TemporalDenoiser()
+    for _ in range(20):
+        noisy = np.clip(clean.astype(int) + rng.normal(0, 8, clean.shape), 0, 255).astype(np.uint8)
+        out = dn.process(noisy, 60)
+    assert np.abs(out.astype(int) - 128).std() < 0.5 * np.abs(noisy.astype(int) - 128).std()
+
+
+def test_denoise_does_not_ghost_moving_objects():
+    from selficamera.processor.enhance import TemporalDenoiser
+
+    dn = TemporalDenoiser()
+    a = np.full((100, 100, 3), 40, np.uint8)
+    for _ in range(10):
+        dn.process(a, 100)
+    b = a.copy()
+    b[30:70, 30:70] = 220  # something bright moves in
+    out = dn.process(b, 100)
+    assert out[50, 50, 0] > 200  # shows up at once, no trail
+    assert dn.process(a, 0) is a  # off = untouched
+
+
+def test_soft_skin_smooths_only_the_face():
+    from selficamera.processor.enhance import soft_skin
+
+    rng = np.random.default_rng(1)
+    frame = np.full((200, 200, 3), (120, 140, 200), np.uint8)  # skin-like tone (BGR)
+    frame = np.clip(frame.astype(int) + rng.normal(0, 10, frame.shape), 0, 255).astype(np.uint8)
+    face = [(60, 50, 80, 100, 0.9)]
+    out = soft_skin(frame, face, 80)
+    inside = (slice(80, 130), slice(80, 120))
+    per_channel = lambda im: im[inside].astype(float).std(axis=(0, 1)).mean()  # noqa: E731
+    assert per_channel(out) < 0.6 * per_channel(frame)
+    assert np.array_equal(out[:20, :20], frame[:20, :20])  # far from the face: untouched
+    assert soft_skin(frame, [], 80) is frame and soft_skin(frame, face, 0) is frame
+
+
+def test_sharpen_adds_detail():
+    from selficamera.processor.enhance import sharpen
+
+    frame = cv2.GaussianBlur(np.tile(np.repeat([60, 190], 16).astype(np.uint8), (64, 2))[:, :, None].repeat(3, 2), (0, 0), 2)
+    out = sharpen(frame, 60)
+    assert np.abs(np.diff(out[:, :, 0].astype(int), axis=1)).max() > np.abs(np.diff(frame[:, :, 0].astype(int), axis=1)).max()
+    assert sharpen(frame, 0) is frame
+
+
+def test_pipeline_detects_faces_for_soft_skin_without_auto_light():
+    faces = _FakeFaces([(20, 10, 40, 50, 0.9)])
+    proc = FrameProcessor(settings={"auto_light": False, "soft_skin": 50}, output_size=(96, 96), face_detector=faces)
+    proc.process(np.full((240, 320, 3), 60, np.uint8))
+    assert faces.calls == 1 and proc.enhance_status["faces"] == 1
+
+
+@pytest.mark.parametrize("size", [(260, 260), (462, 260)])
+def test_pipeline_all_enhancements(presenter_frame, size):
+    faces = _FakeFaces([(40, 30, 80, 100, 0.9)])
+    proc = FrameProcessor(settings={"denoise": 60, "soft_skin": 60, "sharpen": 40}, output_size=size, face_detector=faces)
+    for _ in range(3):
+        out = proc.process(presenter_frame)
+    assert out.shape[:2] == (size[1], size[0]) and out.dtype == np.uint8
